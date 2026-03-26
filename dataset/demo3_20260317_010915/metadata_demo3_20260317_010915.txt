@@ -1,0 +1,15 @@
+created_at=2026-03-17 01:09:15
+contributor=demo3
+agreement=True
+labels=Left,Right,fist_close
+labels_saved=True
+repeats=3
+prep_s=2.0
+hold_s=3.0
+rest_s=2.0
+record_rest=True
+channel_count=4
+sample_rate_hz=500
+num_samples=4375
+data_file=emg_data_demo3_20260317_010915.csv
+data_path=demo3_20260317_010915/emg_data_demo3_20260317_010915.csv

@@ -1,0 +1,17 @@
+created_at=2026-03-17 01:50:57
+contributor=asdfsadfds
+agreement=True
+labels=Left,Right,fist_close
+labels_saved=True
+repeats=3
+prep_s=2.0
+hold_s=3.0
+rest_s=2.0
+record_rest=True
+channel_count=4
+sample_rate_hz=500
+num_samples=24800
+expected_num_samples=22500
+sample_coverage_pct=110.22
+data_file=emg_data_asdfsadfds_20260317_015057.csv
+data_path=asdfsadfds_20260317_015057/emg_data_asdfsadfds_20260317_015057.csv
