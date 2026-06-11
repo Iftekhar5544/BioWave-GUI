@@ -15,13 +15,7 @@ The application is built around a complete workflow:
 ## Project Layout
 
 ```text
-EMG_with_IMU/
-|-- esp_code_emg_imu.txt
-|-- archive/
-|   |-- app.py
-|   |-- esp_code.txt
-|   `-- recordings/
-`-- 01_BioWave-EMG Data Collection APP/
+`01_BioWave-EMG Data Collection APP/
     |-- README.md
     |-- requirements.txt
     |-- code/
