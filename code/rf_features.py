@@ -171,8 +171,18 @@ def extract_window_features(window, sample_rate=500):
     feats.extend((rms_vals / mean_rms).tolist())
 
     # Pairwise channel correlation features.
-    corr = np.corrcoef(arr_centered.T)
+    std = np.std(arr_centered, axis=0)
+    valid = np.isfinite(std) & (std > 1e-8)
+    if np.any(valid):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = np.corrcoef(arr_centered.T)
+    else:
+        corr = np.eye(n_ch, dtype=np.float32)
     corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0)
+    if not np.all(valid):
+        corr[~valid, :] = 0.0
+        corr[:, ~valid] = 0.0
+        np.fill_diagonal(corr, 1.0)
     for a in range(n_ch):
         for b in range(a + 1, n_ch):
             feats.append(float(corr[a, b]))

@@ -3,11 +3,18 @@ import time
 import os
 import csv
 import json
+import socket
+import struct
+import subprocess
+import hashlib
+import hmac
 import threading
 import traceback
 import serial
 import serial.tools.list_ports
 import numpy as np
+from dataclasses import dataclass
+from urllib.parse import quote
 os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt5")
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false")
 import pyqtgraph as pg
@@ -168,8 +175,8 @@ SAMPLE_RATE = 500                # Hz (matching ESP32 sketch)
 PLOT_REFRESH_MS = 20             # 50 FPS UI refresh
 SERIAL_BATCH_SIZE = 25           # 50 ms @ 500 Hz
 DEFAULT_ANALYSIS_MS = 200        # Analysis window for MAV/RMS
-DEFAULT_THRESHOLD = 60.0         # RMS threshold after calibration/centering
-DEFAULT_HZ_THRESHOLD = 60.0      # Dominant-frequency cutoff in Hz
+DEFAULT_THRESHOLD = 45.0         # EMG RMS threshold before calibration auto-tunes it
+DEFAULT_HZ_THRESHOLD = 30.0      # EMG dominant-frequency gate before calibration auto-tunes it
 FFT_MIN_HZ = 20.0                # Typical lower EMG band edge
 FFT_MAX_HZ = 220.0               # Keep below Nyquist (250Hz at 500Hz sample rate)
 BAND_DEFS = [(20.0, 60.0), (60.0, 120.0), (120.0, 220.0)]
@@ -184,6 +191,24 @@ DEFAULT_TASK_REPEATS = 3
 DEFAULT_RECORD_CSV = "realtime_collected_emg.csv"
 DEFAULT_RF_MODEL_ARTIFACT = "rf_realtime_model.joblib"
 MIN_RECORD_SAMPLE_RATIO = 0.80
+USB_SERIAL_BAUD = 115200
+SERIAL_BOOT_WAIT_S = 3.5
+SERIAL_RESPONSE_TIMEOUT_S = 15.0
+WIFI_STREAM_PORT = 5000
+WIFI_CONTROL_PORT = 5001
+DISCOVERY_ADDRESS = "255.255.255.255"
+DISCOVERY_TIMEOUT = 1.2
+CONTROL_TIMEOUT = 2.0
+KEEPALIVE_INTERVAL_MS = 2000
+WIRELESS_EMG_CHANNELS = 8
+WIRELESS_IMU_CHANNELS = 3
+WIRELESS_TOTAL_CHANNELS = WIRELESS_EMG_CHANNELS + WIRELESS_IMU_CHANNELS
+WIFI_PACKET_HEADER_FORMAT = "<4sBBHI"
+WIFI_PACKET_HEADER_SIZE = struct.calcsize(WIFI_PACKET_HEADER_FORMAT)
+WIRELESS_FRAME_FORMAT = "<IIII8HfffB3x"
+WIRELESS_FRAME_SIZE = struct.calcsize(WIRELESS_FRAME_FORMAT)
+WIRELESS_FRAMES_PER_PACKET = 5
+WIRELESS_PACKET_SIZE = WIFI_PACKET_HEADER_SIZE + (WIRELESS_FRAME_SIZE * WIRELESS_FRAMES_PER_PACKET)
 
 CAL_REST_MS = 3000               # Rest capture duration
 CAL_FLEX_MS = 3000               # Flex capture duration
@@ -195,8 +220,14 @@ BASE_ADAPT_GUARD = 80.0          # Update baseline only when near rest
 
 Y_MIN = -1200
 Y_MAX = 1200
-Y_AXIS_FIXED_WIDTH = 62          # Reserve constant space for Y tick labels
-Y_AXIS_TICK_TEXT_WIDTH = 44      # Placeholder width so digit-count changes don't shift plot
+IMU_Y_MIN = -90
+IMU_Y_MAX = 90
+Y_AXIS_FIXED_WIDTH = 25          # Keep only a slim gutter when Y tick values are hidden
+Y_AXIS_TICK_TEXT_WIDTH = 0       # No horizontal space needed for hidden Y tick values
+LIVE_Y_PADDING_RATIO = 0.10
+LIVE_Y_MIN_HALF_RANGE = 25.0
+IMU_LIVE_Y_MIN_HALF_RANGE = 5.0
+PLOT_AXIS_TICK_FONT_PT = 9
 
 
 class SerialWorker(QThread):
@@ -212,6 +243,16 @@ class SerialWorker(QThread):
         self.is_socket_url = str(port_name).strip().lower().startswith("socket://")
         self._running = True
         self._serial = None
+        self._packet_sequence_counter = 0
+
+    def _emit_batch(self, batch):
+        arr = np.asarray(batch, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] <= 0:
+            return
+        packet_no = int(self._packet_sequence_counter)
+        self._packet_sequence_counter += 1
+        packet_numbers = np.full(arr.shape[0], packet_no, dtype=np.int64)
+        self.batch_received.emit({"batch": arr, "packet_numbers": packet_numbers, "source": "serial"})
 
     def _close_serial(self):
         try:
@@ -262,7 +303,7 @@ class SerialWorker(QThread):
 
                         batch.append(vals)
                         if len(batch) >= self.batch_size:
-                            self.batch_received.emit(np.asarray(batch, dtype=np.float32))
+                            self._emit_batch(batch)
                             batch = []
                 except Exception as e:
                     if not self._running:
@@ -277,7 +318,7 @@ class SerialWorker(QThread):
                     break
 
             if batch:
-                self.batch_received.emit(np.asarray(batch, dtype=np.float32))
+                self._emit_batch(batch)
 
         finally:
             self._close_serial()
@@ -285,6 +326,687 @@ class SerialWorker(QThread):
     def stop(self):
         self._running = False
         self.wait()
+
+
+@dataclass
+class DeviceInfo:
+    ip: str
+    device_id: str
+    device_name: str
+    wifi_mode: str
+    reported_ip: str
+    imu_ready: bool
+    streaming: bool
+    firmware: str
+
+    @property
+    def summary(self):
+        return f"{self.device_name} @ {self.ip} ({self.wifi_mode})"
+
+
+@dataclass
+class SerialDeviceInfo:
+    port_name: str
+    device_id: str
+    device_name: str
+    imu_ready: bool
+    wifi_saved: bool
+    firmware: str
+
+
+def sign_message(secret, *parts):
+    message = "|".join(str(part) for part in parts)
+    return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def get_local_ip_for_target(target_ip):
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect((target_ip, 1))
+        return probe.getsockname()[0]
+    finally:
+        probe.close()
+
+
+def run_command_text(command):
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return result.stdout or ""
+
+
+def get_connected_ssid():
+    if sys.platform != "win32":
+        return ""
+
+    output = run_command_text(["netsh", "wlan", "show", "interfaces"])
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("SSID") and "BSSID" not in stripped and ":" in stripped:
+            return stripped.split(":", 1)[1].strip()
+    return ""
+
+
+class ControlProtocol:
+    @staticmethod
+    def parse_device_info(message, source_ip):
+        parts = message.strip().split("|")
+        if len(parts) != 8 or parts[0] != "HELLO":
+            raise ValueError("Unexpected device response.")
+
+        return DeviceInfo(
+            ip=source_ip,
+            device_id=parts[1],
+            device_name=parts[2],
+            wifi_mode=parts[3],
+            reported_ip=parts[4],
+            imu_ready=parts[5] == "1",
+            streaming=parts[6] == "1",
+            firmware=parts[7],
+        )
+
+    @staticmethod
+    def send_and_receive(message, target_ip, expect_multiple=False, timeout=CONTROL_TIMEOUT, broadcast=False):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(0.2 if expect_multiple else timeout)
+        if broadcast:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        responses = []
+        deadline = time.monotonic() + timeout
+        try:
+            sock.sendto(message.encode("utf-8"), (target_ip, WIFI_CONTROL_PORT))
+            if expect_multiple:
+                while time.monotonic() < deadline:
+                    try:
+                        data, addr = sock.recvfrom(2048)
+                        responses.append((data.decode("utf-8", errors="replace"), addr[0]))
+                    except socket.timeout:
+                        continue
+                return responses
+
+            data, addr = sock.recvfrom(2048)
+            return data.decode("utf-8", errors="replace"), addr[0]
+        finally:
+            sock.close()
+
+    @staticmethod
+    def discover():
+        devices = {}
+        responses = ControlProtocol.send_and_receive(
+            "DISCOVER",
+            DISCOVERY_ADDRESS,
+            expect_multiple=True,
+            timeout=DISCOVERY_TIMEOUT,
+            broadcast=True,
+        )
+        for response, source_ip in responses:
+            try:
+                device = ControlProtocol.parse_device_info(response, source_ip)
+                devices[device.ip] = device
+            except ValueError:
+                continue
+        return list(devices.values())
+
+    @staticmethod
+    def get_challenge(target_ip):
+        response, _ = ControlProtocol.send_and_receive("CHALLENGE", target_ip)
+        parts = response.strip().split("|")
+        if len(parts) != 2 or parts[0] != "CHALLENGE":
+            raise RuntimeError("Device did not return a valid challenge.")
+        return parts[1]
+
+    @staticmethod
+    def authenticated_command(target_ip, secret, command, *payload):
+        if not secret:
+            raise RuntimeError("Device access key is required.")
+
+        challenge = ControlProtocol.get_challenge(target_ip)
+        auth = sign_message(secret, command, challenge, *payload)
+        message = "|".join([command, challenge, *payload, auth])
+        response, _ = ControlProtocol.send_and_receive(message, target_ip)
+
+        parts = response.strip().split("|")
+        if not parts:
+            raise RuntimeError("Device returned an empty response.")
+        if parts[0] == "ERR":
+            detail = parts[1] if len(parts) > 1 else "UNKNOWN"
+            raise RuntimeError(f"Device rejected command: {detail}")
+        if parts[0] != "ACK":
+            raise RuntimeError("Unexpected device acknowledgement.")
+        return parts[1:]
+
+    @staticmethod
+    def start_stream(target_ip, secret, client_ip, client_port):
+        return ControlProtocol.authenticated_command(
+            target_ip,
+            secret,
+            "START",
+            client_ip,
+            str(client_port),
+        )
+
+    @staticmethod
+    def stop_stream(target_ip, secret):
+        return ControlProtocol.authenticated_command(target_ip, secret, "STOP")
+
+    @staticmethod
+    def ping(target_ip, secret):
+        return ControlProtocol.authenticated_command(target_ip, secret, "PING")
+
+
+class WiFiSerialProvisionProtocol:
+    @staticmethod
+    def available_ports():
+        return list(serial.tools.list_ports.comports())
+
+    @staticmethod
+    def _exchange_line(port_name, command, expected_prefixes, timeout=SERIAL_RESPONSE_TIMEOUT_S):
+        try:
+            with serial.Serial(port_name, USB_SERIAL_BAUD, timeout=0.3, write_timeout=1) as ser:
+                ser.setDTR(False)
+                ser.setRTS(False)
+                time.sleep(0.15)
+                time.sleep(SERIAL_BOOT_WAIT_S)
+                ser.reset_input_buffer()
+                ser.reset_output_buffer()
+                ser.write((command + "\n").encode("utf-8"))
+                ser.flush()
+
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    raw_line = ser.readline()
+                    if not raw_line:
+                        continue
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    if any(line.startswith(prefix) for prefix in expected_prefixes):
+                        return line
+        except serial.SerialException as exc:
+            raise RuntimeError(f"Serial communication failed on {port_name}: {exc}") from exc
+
+        raise RuntimeError("The ESP32 did not return a serial response in time.")
+
+    @staticmethod
+    def query_info(port_name):
+        response = WiFiSerialProvisionProtocol._exchange_line(port_name, "INFO", expected_prefixes=("INFO|", "ERR|"))
+        parts = response.split("|")
+        if len(parts) >= 2 and parts[0] == "ERR":
+            raise RuntimeError(f"ESP32 returned an error: {parts[1]}")
+        if len(parts) != 6 or parts[0] != "INFO":
+            raise RuntimeError(f"Unexpected serial response: {response}")
+
+        return SerialDeviceInfo(
+            port_name=port_name,
+            device_id=parts[1],
+            device_name=parts[2],
+            imu_ready=parts[3] == "1",
+            wifi_saved=parts[4] == "1",
+            firmware=parts[5],
+        )
+
+    @staticmethod
+    def provision(port_name, ssid, password):
+        encoded_ssid = quote(ssid, safe="")
+        encoded_password = quote(password, safe="")
+        response = WiFiSerialProvisionProtocol._exchange_line(
+            port_name,
+            f"PROVISION|{encoded_ssid}|{encoded_password}",
+            expected_prefixes=("ACK|", "ERR|"),
+            timeout=8.0,
+        )
+        parts = response.split("|")
+        if len(parts) >= 2 and parts[0] == "ACK" and parts[1] == "PROVISIONED":
+            return
+        if len(parts) >= 2 and parts[0] == "ERR":
+            raise RuntimeError(f"ESP32 rejected provisioning: {parts[1]}")
+        raise RuntimeError(f"Unexpected serial response: {response}")
+
+
+class WirelessStreamWorker(QThread):
+    batch_received = pyqtSignal(object)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, port=WIFI_STREAM_PORT):
+        super().__init__()
+        self.port = int(port)
+        self._running = True
+        self._sock = None
+        self._fallback_packet_sequence = 0
+
+    def _parse_datagram(self, data):
+        if len(data) == WIRELESS_PACKET_SIZE:
+            magic, version, frame_count, frame_size, packet_sequence = struct.unpack(
+                WIFI_PACKET_HEADER_FORMAT, data[:WIFI_PACKET_HEADER_SIZE]
+            )
+            if magic != b"BWIM" or version != 1 or frame_size != WIRELESS_FRAME_SIZE:
+                return None
+            payload = data[WIFI_PACKET_HEADER_SIZE:]
+            expected_payload = frame_count * frame_size
+            if len(payload) != expected_payload:
+                return None
+
+            rows = []
+            for offset in range(0, expected_payload, WIRELESS_FRAME_SIZE):
+                frame = payload[offset : offset + WIRELESS_FRAME_SIZE]
+                _frame_id, _frame_ts, _imu_id, _imu_ts, *frame_fields = struct.unpack(WIRELESS_FRAME_FORMAT, frame)
+                row = [float(v) for v in frame_fields[:WIRELESS_EMG_CHANNELS]]
+                row.extend([float(frame_fields[8]), float(frame_fields[9]), float(frame_fields[10])])
+                rows.append(row)
+            batch = np.asarray(rows, dtype=np.float32)
+            packet_numbers = np.full(batch.shape[0], int(packet_sequence), dtype=np.int64)
+            return {"batch": batch, "packet_numbers": packet_numbers, "source": "wireless"}
+
+        if len(data) == (WIRELESS_FRAME_SIZE * WIRELESS_FRAMES_PER_PACKET):
+            rows = []
+            for offset in range(0, len(data), WIRELESS_FRAME_SIZE):
+                frame = data[offset : offset + WIRELESS_FRAME_SIZE]
+                _frame_id, _frame_ts, _imu_id, _imu_ts, *frame_fields = struct.unpack(WIRELESS_FRAME_FORMAT, frame)
+                row = [float(v) for v in frame_fields[:WIRELESS_EMG_CHANNELS]]
+                row.extend([float(frame_fields[8]), float(frame_fields[9]), float(frame_fields[10])])
+                rows.append(row)
+            batch = np.asarray(rows, dtype=np.float32)
+            packet_no = int(self._fallback_packet_sequence)
+            self._fallback_packet_sequence += 1
+            packet_numbers = np.full(batch.shape[0], packet_no, dtype=np.int64)
+            return {"batch": batch, "packet_numbers": packet_numbers, "source": "wireless_legacy"}
+
+        if len(data) == WIRELESS_FRAME_SIZE:
+            _frame_id, _frame_ts, _imu_id, _imu_ts, *frame_fields = struct.unpack(WIRELESS_FRAME_FORMAT, data)
+            row = [float(v) for v in frame_fields[:WIRELESS_EMG_CHANNELS]]
+            row.extend([float(frame_fields[8]), float(frame_fields[9]), float(frame_fields[10])])
+            batch = np.asarray([row], dtype=np.float32)
+            packet_no = int(self._fallback_packet_sequence)
+            self._fallback_packet_sequence += 1
+            packet_numbers = np.full(batch.shape[0], packet_no, dtype=np.int64)
+            return {"batch": batch, "packet_numbers": packet_numbers, "source": "wireless_single"}
+
+        return None
+
+    def run(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("0.0.0.0", self.port))
+        self._sock.settimeout(1.0)
+
+        try:
+            while self._running:
+                try:
+                    data, _addr = self._sock.recvfrom(2048)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+                payload = self._parse_datagram(data)
+                if payload is None:
+                    continue
+                batch = np.asarray(payload.get("batch", []), dtype=np.float32)
+                if batch.size > 0:
+                    self.batch_received.emit(payload)
+        except Exception as exc:
+            if self._running:
+                self.error_occurred.emit(f"Wireless stream error: {exc}")
+        finally:
+            try:
+                if self._sock is not None:
+                    self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+
+    def stop(self):
+        self._running = False
+        try:
+            if self._sock is not None:
+                self._sock.close()
+        except Exception:
+            pass
+        self.wait()
+
+
+class ConnectionModeDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        apply_app_icon(self)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setWindowTitle("Connection Medium")
+        self.setModal(True)
+        self.resize(420, 230)
+        apply_dark_title_bar(self)
+        self.selected_medium = ""
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        lbl_title = QLabel("Choose how this BioWave session will connect.")
+        lbl_title.setWordWrap(True)
+        lbl_title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.addWidget(lbl_title)
+
+        lbl_note = QLabel(
+            "Wired keeps the original COM/socket workflow. Wireless opens Wi-Fi provisioning and device control."
+        )
+        lbl_note.setWordWrap(True)
+        lbl_note.setStyleSheet(themed_label_style("muted"))
+        layout.addWidget(lbl_note)
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        self.btn_wired = QPushButton("Wired")
+        self.btn_wired.setMinimumHeight(48)
+        self.btn_wired.setStyleSheet(themed_button_style("accent"))
+        self.btn_wired.clicked.connect(lambda: self._select_medium("wired"))
+        btn_row.addWidget(self.btn_wired)
+
+        self.btn_wireless = QPushButton("Wireless")
+        self.btn_wireless.setMinimumHeight(48)
+        self.btn_wireless.setStyleSheet(themed_button_style("success"))
+        self.btn_wireless.clicked.connect(lambda: self._select_medium("wireless"))
+        btn_row.addWidget(self.btn_wireless)
+        layout.addLayout(btn_row)
+
+    def _select_medium(self, medium):
+        self.selected_medium = str(medium)
+        self.accept()
+
+
+class USBProvisionDialog(QDialog):
+    def __init__(self, parent=None, initial_ssid=""):
+        super().__init__(parent)
+        apply_app_icon(self)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setWindowTitle("Wireless USB Provisioning")
+        self.setModal(True)
+        self.resize(620, 420)
+        apply_dark_title_bar(self)
+        self.selected_port = ""
+        self.device_info = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        intro = QLabel(
+            "Connect the ESP32-S3 with USB, probe the port, then send Wi-Fi credentials for wireless mode."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.current_wifi_label = QLabel(f"Current PC Wi-Fi: {get_connected_ssid() or 'Not detected'}")
+        self.current_wifi_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.current_wifi_label)
+
+        row_port = QHBoxLayout()
+        row_port.addWidget(QLabel("Serial Port:"))
+        self.port_selector = QComboBox()
+        self.port_selector.setEditable(True)
+        row_port.addWidget(self.port_selector, stretch=1)
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_refresh.setStyleSheet(themed_button_style("accent"))
+        self.btn_refresh.clicked.connect(self.refresh_ports)
+        row_port.addWidget(self.btn_refresh)
+        layout.addLayout(row_port)
+
+        self.port_hint_label = QLabel("Serial device: not probed yet")
+        self.port_hint_label.setWordWrap(True)
+        self.port_hint_label.setStyleSheet(themed_label_style("muted"))
+        layout.addWidget(self.port_hint_label)
+
+        form = QFormLayout()
+        self.ssid_input = QLineEdit(initial_ssid or get_connected_ssid())
+        self.pass_input = QLineEdit()
+        self.pass_input.setEchoMode(QLineEdit.Password)
+        form.addRow("Home Wi-Fi SSID:", self.ssid_input)
+        form.addRow("Home Wi-Fi Password:", self.pass_input)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.btn_probe = QPushButton("Probe Selected Port")
+        self.btn_probe.setStyleSheet(themed_button_style("accent"))
+        self.btn_probe.clicked.connect(self.probe_selected_port)
+        btn_row.addWidget(self.btn_probe)
+
+        self.btn_send = QPushButton("Send Wi-Fi to ESP")
+        self.btn_send.setStyleSheet(themed_button_style("success"))
+        self.btn_send.clicked.connect(self.send_credentials)
+        btn_row.addWidget(self.btn_send)
+
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setStyleSheet(themed_button_style("muted"))
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(self.btn_cancel)
+        layout.addLayout(btn_row)
+
+        self.status_label = QLabel("Select the ESP32 serial port, probe it, then send the Wi-Fi credentials.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(themed_label_style("muted"))
+        layout.addWidget(self.status_label)
+
+        self.refresh_ports()
+
+    def selected_port_name(self):
+        data = self.port_selector.currentData()
+        if data:
+            return str(data).strip()
+        return self.port_selector.currentText().strip()
+
+    def refresh_ports(self):
+        selected = self.selected_port_name()
+        self.port_selector.clear()
+        ports = WiFiSerialProvisionProtocol.available_ports()
+        if not ports:
+            self.status_label.setText("No serial ports found. Plug in the ESP32-S3 and refresh again.")
+            return
+
+        for port in ports:
+            self.port_selector.addItem(f"{port.device} - {port.description}", port.device)
+
+        if selected:
+            idx = self.port_selector.findData(selected)
+            if idx >= 0:
+                self.port_selector.setCurrentIndex(idx)
+            else:
+                self.port_selector.setCurrentText(selected)
+
+    def probe_selected_port(self):
+        port_name = self.selected_port_name()
+        if not port_name:
+            QMessageBox.warning(self, "No Serial Port Selected", "Select the ESP32 serial port first.")
+            return
+
+        try:
+            self.device_info = WiFiSerialProvisionProtocol.query_info(port_name)
+        except Exception as exc:
+            self.device_info = None
+            QMessageBox.warning(self, "Probe Failed", str(exc))
+            self.port_hint_label.setText(f"Selected serial port: {port_name}")
+            return
+
+        self.selected_port = port_name
+        self.port_hint_label.setText(
+            f"Detected {self.device_info.device_name} on {port_name} | IMU ready={self.device_info.imu_ready} | "
+            f"Wi-Fi saved={self.device_info.wifi_saved} | FW={self.device_info.firmware}"
+        )
+        self.status_label.setText("ESP32 responded over USB. You can now send the Wi-Fi credentials.")
+
+    def send_credentials(self):
+        port_name = self.selected_port_name()
+        if not port_name:
+            QMessageBox.warning(self, "No Serial Port Selected", "Select the ESP32 serial port first.")
+            return
+
+        ssid = self.ssid_input.text().strip()
+        password = self.pass_input.text()
+        if not ssid:
+            QMessageBox.warning(self, "Missing SSID", "Home Wi-Fi SSID cannot be empty.")
+            return
+
+        try:
+            WiFiSerialProvisionProtocol.provision(port_name, ssid, password)
+        except Exception as exc:
+            QMessageBox.critical(self, "USB Provisioning Failed", str(exc))
+            return
+
+        QMessageBox.information(
+            self,
+            "Provisioned",
+            "The ESP32 accepted the Wi-Fi credentials over USB and will restart.\n\n"
+            "After it joins Wi-Fi, discover it from the Wireless configuration window.",
+        )
+        self.accept()
+
+
+class WirelessConfigDialog(QDialog):
+    connect_requested = pyqtSignal(object, str)
+    discover_requested = pyqtSignal()
+    provision_requested = pyqtSignal()
+
+    def __init__(self, access_key="", parent=None):
+        super().__init__(parent)
+        apply_app_icon(self)
+        self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
+        self.setWindowTitle("Wireless Configuration")
+        self.setModal(True)
+        self.resize(700, 360)
+        apply_dark_title_bar(self)
+        self.devices = []
+        self.connected_ok = False
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        intro = QLabel(
+            "Provision the ESP32 over USB if needed, discover it on the current Wi-Fi, then connect the wireless stream."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.lbl_hint = QLabel(
+            "Wireless stream uses the BioWave Wi-Fi control plane and the 11-channel EMG + IMU UDP data stream."
+        )
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setStyleSheet(themed_label_style("muted"))
+        layout.addWidget(self.lbl_hint)
+
+        row_device = QHBoxLayout()
+        row_device.addWidget(QLabel("Device:"))
+        self.device_selector = QComboBox()
+        row_device.addWidget(self.device_selector, stretch=1)
+        self.btn_discover = QPushButton("Discover Device")
+        self.btn_discover.setStyleSheet(themed_button_style("accent"))
+        self.btn_discover.clicked.connect(self.discover_requested.emit)
+        row_device.addWidget(self.btn_discover)
+        layout.addLayout(row_device)
+
+        self.device_info_label = QLabel("No wireless device selected.")
+        self.device_info_label.setWordWrap(True)
+        self.device_info_label.setStyleSheet(themed_label_style("muted"))
+        layout.addWidget(self.device_info_label)
+
+        row_key = QHBoxLayout()
+        row_key.addWidget(QLabel("Access Key:"))
+        self.access_key_input = QLineEdit(access_key)
+        self.access_key_input.setEchoMode(QLineEdit.Password)
+        self.access_key_input.setPlaceholderText("Device access key")
+        row_key.addWidget(self.access_key_input, stretch=1)
+        layout.addLayout(row_key)
+
+        btn_row = QHBoxLayout()
+        self.btn_provision = QPushButton("Provision via USB")
+        self.btn_provision.setStyleSheet(themed_button_style("accent"))
+        self.btn_provision.clicked.connect(self.provision_requested.emit)
+        btn_row.addWidget(self.btn_provision)
+
+        self.btn_connect = QPushButton("Connect Wireless")
+        self.btn_connect.setStyleSheet(themed_button_style("success"))
+        self.btn_connect.clicked.connect(self.on_connect_clicked)
+        btn_row.addWidget(self.btn_connect)
+
+        self.btn_apply = QPushButton("Apply")
+        self.btn_apply.setStyleSheet(themed_button_style("accent"))
+        self.btn_apply.clicked.connect(self.accept)
+        self.btn_apply.setEnabled(False)
+        btn_row.addWidget(self.btn_apply)
+
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.setStyleSheet(themed_button_style("muted"))
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(self.btn_cancel)
+        layout.addLayout(btn_row)
+
+        self.status_label = QLabel("Discover a device and connect the wireless stream before applying.")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet(themed_label_style("muted"))
+        layout.addWidget(self.status_label)
+
+        self.device_selector.currentIndexChanged.connect(self._refresh_device_info)
+
+    def set_devices(self, devices, selected_ip=""):
+        self.devices = list(devices or [])
+        self.device_selector.clear()
+        for device in self.devices:
+            self.device_selector.addItem(device.summary, device)
+
+        if selected_ip:
+            for index, device in enumerate(self.devices):
+                if device.ip == selected_ip:
+                    self.device_selector.setCurrentIndex(index)
+                    break
+        self._refresh_device_info()
+
+    def selected_device(self):
+        data = self.device_selector.currentData()
+        return data if isinstance(data, DeviceInfo) else None
+
+    def _refresh_device_info(self):
+        device = self.selected_device()
+        if device is None:
+            self.device_info_label.setText("No wireless device selected.")
+            return
+        self.device_info_label.setText(
+            f"{device.device_name} | IP={device.ip} | Mode={device.wifi_mode} | FW={device.firmware} | "
+            f"IMU ready={device.imu_ready}"
+        )
+
+    def on_connect_clicked(self):
+        device = self.selected_device()
+        if device is None:
+            QMessageBox.warning(self, "No Device", "Discover and select a BioWave wireless device first.")
+            return
+        access_key = self.access_key_input.text().strip()
+        if not access_key:
+            QMessageBox.warning(self, "Missing Access Key", "Enter the device access key before connecting.")
+            return
+        self.connect_requested.emit(device, access_key)
+
+    def set_connection_state(self, is_connected, message=""):
+        self.connected_ok = bool(is_connected)
+        self.btn_apply.setEnabled(self.connected_ok)
+        if self.connected_ok:
+            self.status_label.setText(message or "Wireless stream connected. Click Apply to unlock the workflow.")
+            self.status_label.setStyleSheet(themed_label_style("success"))
+        else:
+            self.status_label.setText(message or "Discover a device and connect the wireless stream before applying.")
+            self.status_label.setStyleSheet(themed_label_style("muted"))
+
+
+@dataclass
+class TimedRecordBatch:
+    timestamps_ms: np.ndarray
+    packet_numbers: np.ndarray
+    trial_id: int
+    label: str
+    data: np.ndarray
 
 
 class RFRealtimeInferenceWorker(QThread):
@@ -301,10 +1023,12 @@ class RFRealtimeInferenceWorker(QThread):
         self._class_names = []
         self._window_batch = None
 
-    def set_model(self, model, class_names):
+    def set_model(self, model, class_names, sample_rate=None):
         with self._lock:
             self._model = model
             self._class_names = [str(x) for x in list(class_names or [])]
+            if sample_rate is not None:
+                self.sample_rate = int(max(1, sample_rate))
             self._window_batch = None
         self._pending_event.clear()
 
@@ -426,6 +1150,91 @@ class RFRealtimeInferenceWorker(QThread):
                 self.error_occurred.emit(str(e))
 
 
+class RecordedCsvSaveWorker(QThread):
+    save_completed = pyqtSignal(object)
+
+    def __init__(self, batches, data_csv_path, metadata_path, metadata_lines, parent=None):
+        super().__init__(parent)
+        self._batches = list(batches or [])
+        self._data_csv_path = str(data_csv_path or "")
+        self._metadata_path = str(metadata_path or "")
+        self._metadata_lines = list(metadata_lines or [])
+
+    def run(self):
+        try:
+            os.makedirs(os.path.dirname(self._data_csv_path) or ".", exist_ok=True)
+            header = ["Timestamp_ms", "Packet_Number", "Trial_ID"] + [
+                f"Ch{i}" for i in range(1, WIRELESS_TOTAL_CHANNELS + 1)
+            ] + ["Label"]
+            with open(self._data_csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(header)
+                for batch in self._batches:
+                    data = np.asarray(batch.data, dtype=np.float32)
+                    if data.ndim != 2 or data.shape[0] <= 0:
+                        continue
+                    ts = np.asarray(batch.timestamps_ms, dtype=np.float64).reshape(-1)
+                    packets = np.asarray(batch.packet_numbers, dtype=np.int64).reshape(-1)
+                    n_rows = data.shape[0]
+                    n_cols = int(min(WIRELESS_TOTAL_CHANNELS, data.shape[1]))
+                    for idx in range(n_rows):
+                        row = [
+                            float(ts[idx]) if idx < ts.size else 0.0,
+                            int(packets[idx]) if idx < packets.size else -1,
+                            int(batch.trial_id),
+                        ]
+                        row.extend(float(v) for v in data[idx, :n_cols])
+                        if n_cols < WIRELESS_TOTAL_CHANNELS:
+                            row.extend([""] * (WIRELESS_TOTAL_CHANNELS - n_cols))
+                        row.append(str(batch.label))
+                        writer.writerow(row)
+
+            os.makedirs(os.path.dirname(self._metadata_path) or ".", exist_ok=True)
+            with open(self._metadata_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(self._metadata_lines) + "\n")
+
+            self.save_completed.emit(
+                {
+                    "ok": True,
+                    "data_csv_path": self._data_csv_path,
+                    "metadata_path": self._metadata_path,
+                }
+            )
+        except Exception as e:
+            self.save_completed.emit(
+                {
+                    "ok": False,
+                    "data_csv_path": self._data_csv_path,
+                    "metadata_path": self._metadata_path,
+                    "error": str(e),
+                }
+            )
+
+
+class RFTrainingWorker(QThread):
+    status_updated = pyqtSignal(str, str)
+    training_completed = pyqtSignal(object)
+    training_failed = pyqtSignal(str)
+
+    def __init__(self, visualizer, config, parent=None):
+        super().__init__(parent)
+        self._visualizer = visualizer
+        self._config = dict(config or {})
+
+    def _emit_status(self, text, color="#999999"):
+        self.status_updated.emit(str(text), str(color))
+
+    def run(self):
+        try:
+            cfg = dict(self._config)
+            cfg["_status_callback"] = self._emit_status
+            cfg["_defer_auto_load"] = True
+            result = self._visualizer.train_rf_with_config(cfg)
+            self.training_completed.emit(result)
+        except Exception as e:
+            self.training_failed.emit(f"{e}\n\n{traceback.format_exc()}")
+
+
 class CalibrationDialog(QDialog):
     start_requested = pyqtSignal()
     cancel_requested = pyqtSignal()
@@ -468,8 +1277,8 @@ class CalibrationDialog(QDialog):
         lbl_channel.setStyleSheet("font-weight: bold;")
         channel_row.addWidget(lbl_channel)
         self.spin_channels = QSpinBox()
-        self.spin_channels.setRange(1, 9)
-        self.spin_channels.setValue(int(max(1, min(9, channel_count))))
+        self.spin_channels.setRange(2, 11)
+        self.spin_channels.setValue(int(max(2, min(11, channel_count))))
         self.spin_channels.setButtonSymbols(QAbstractSpinBox.UpDownArrows)
         self.spin_channels.setStyleSheet(cal_spin_style)
         self.spin_channels.setMinimumHeight(34)
@@ -628,7 +1437,7 @@ class CalibrationDialog(QDialog):
         self.channel_count_applied.emit(int(self.spin_channels.value()))
 
     def set_channel_count(self, count):
-        self.spin_channels.setValue(int(max(1, min(9, count))))
+        self.spin_channels.setValue(int(max(2, min(11, count))))
         self._update_current_setup_label()
 
     def _update_current_setup_label(self):
@@ -1014,7 +1823,7 @@ class PortConfigDialog(QDialog):
         super().__init__(parent)
         apply_app_icon(self)
         self.setWindowFlag(Qt.WindowContextHelpButtonHint, False)
-        self.setWindowTitle("Port Configuration")
+        self.setWindowTitle("Port Configuration - Wired")
         self.setModal(True)
         self.resize(640, 320)
         apply_dark_title_bar(self)
@@ -1157,6 +1966,7 @@ class RFTrainingDialog(QDialog):
         self.current_model_path = ""
         self.current_run_dir = ""
         self._is_destroying = False
+        self.training_worker = None
         self.dataset_channel_counts = {}
         self.dataset_channel_errors = {}
         self._dataset_signature = tuple()
@@ -1269,7 +2079,7 @@ class RFTrainingDialog(QDialog):
         form.addRow("", self.check_auto_load_model)
         setup_layout.addLayout(form)
         row_output_dir = QHBoxLayout()
-        self.output_dir_edit = QLineEdit(".")
+        self.output_dir_edit = QLineEdit("trained_model")
         row_output_dir.addWidget(self.output_dir_edit)
         self.btn_browse_output_dir = QPushButton("Browse")
         self.btn_browse_output_dir.setStyleSheet(themed_button_style("accent"))
@@ -1498,6 +2308,10 @@ class RFTrainingDialog(QDialog):
             return
 
     def closeEvent(self, event):
+        if self._is_training:
+            QMessageBox.information(self, "Training Running", "Wait for RF training to finish before closing this window.")
+            event.ignore()
+            return
         self._is_destroying = True
         try:
             if getattr(self, "dataset_model", None) is not None:
@@ -1542,9 +2356,10 @@ class RFTrainingDialog(QDialog):
 
         output_dir = str(payload.get("output_dir", self.output_dir_edit.text())).strip()
         if output_dir:
-            self.output_dir_edit.setText(self.visualizer._to_project_relative_path(output_dir))
+            resolved_output_dir = self.visualizer._from_project_relative_path(output_dir)
+            self.output_dir_edit.setText(self.visualizer._to_project_relative_path(resolved_output_dir))
         else:
-            self.output_dir_edit.setText(".")
+            self.output_dir_edit.setText("trained_model")
 
         run_name = str(payload.get("run_name", self.run_name_edit.text())).strip()
         if run_name:
@@ -1552,7 +2367,7 @@ class RFTrainingDialog(QDialog):
 
     def on_add_dataset_files(self):
         start_dir = self.visualizer._from_project_relative_path(
-            self.output_dir_edit.text().strip() or "."
+            self.output_dir_edit.text().strip() or "trained_model"
         )
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -1564,7 +2379,7 @@ class RFTrainingDialog(QDialog):
 
     def on_add_dataset_folder(self):
         start_dir = self.visualizer._from_project_relative_path(
-            self.output_dir_edit.text().strip() or "."
+            self.output_dir_edit.text().strip() or "trained_model"
         )
         folder = QFileDialog.getExistingDirectory(self, "Select Dataset Folder", start_dir)
         if not folder:
@@ -1595,7 +2410,7 @@ class RFTrainingDialog(QDialog):
 
     def on_browse_output_dir(self):
         start_dir = self.visualizer._from_project_relative_path(
-            self.output_dir_edit.text().strip() or "."
+            self.output_dir_edit.text().strip() or "trained_model"
         )
         folder = QFileDialog.getExistingDirectory(self, "Select Training Output Base Folder", start_dir)
         if folder:
@@ -1606,7 +2421,7 @@ class RFTrainingDialog(QDialog):
         if len(csv_paths) == 0:
             raise ValueError("Select at least one dataset CSV file.")
 
-        output_dir = self.output_dir_edit.text().strip() or "."
+        output_dir = self.output_dir_edit.text().strip() or "trained_model"
         run_name = self.visualizer._sanitize_filename_token(self.run_name_edit.text().strip() or "rf_training")
 
         return {
@@ -1625,6 +2440,12 @@ class RFTrainingDialog(QDialog):
 
     def on_train_clicked(self):
         try:
+            if getattr(self.visualizer, "task_session_active", False):
+                QMessageBox.warning(self, "Training Setup", "Finish or cancel the active data collection session before training.")
+                return
+            if len(getattr(self.visualizer, "record_save_workers", [])) > 0:
+                QMessageBox.warning(self, "Training Setup", "A recorded CSV is still saving. Wait for the save to finish before training.")
+                return
             config = self.build_training_config()
         except Exception as e:
             QMessageBox.warning(self, "Training Setup", str(e))
@@ -1633,24 +2454,47 @@ class RFTrainingDialog(QDialog):
         self._is_training = True
         self.update_action_button_states()
         self.set_status("Training started...", "#6a1b9a")
-        QApplication.processEvents()
+        self.training_worker = RFTrainingWorker(self.visualizer, config, self)
+        self.training_worker.status_updated.connect(self.set_status)
+        self.training_worker.training_completed.connect(self.on_training_completed)
+        self.training_worker.training_failed.connect(self.on_training_failed)
+        self.training_worker.finished.connect(self.on_training_worker_finished)
+        self.training_worker.start(QThread.LowPriority)
 
-        try:
-            result = self.visualizer.train_rf_with_config(config)
-            self.apply_training_result(result)
-            self.tabs.setCurrentWidget(self.results_tab)
+    def on_training_completed(self, result):
+        self.apply_training_result(result)
+        self.tabs.setCurrentWidget(self.results_tab)
+        result = dict(result or {})
+        should_auto_load = bool(dict(result.get("config", {})).get("auto_load_model", False))
+        model_path = str(result.get("model_path", "")).strip()
+        if should_auto_load and model_path:
+            try:
+                artifact = result.get("artifact", None)
+                if isinstance(artifact, dict):
+                    self.visualizer.apply_rf_model_artifact(artifact, model_path)
+                else:
+                    self.visualizer.load_rf_model(model_path)
+                self.set_status("Training complete and model loaded.", "#2e7d32")
+            except Exception as e:
+                self.set_status("Training complete; model load failed.", "#f57c00")
+                QMessageBox.warning(self, "Model Load", str(e))
+        else:
             self.set_status("Training complete.", "#2e7d32")
-        except Exception as e:
-            detail = f"{e}\n\n{traceback.format_exc()}"
-            QMessageBox.critical(self, "RF Training Error", detail)
-            self.set_status("Training failed.", "#c62828")
-        finally:
-            self._is_training = False
-            self.update_action_button_states()
+
+    def on_training_failed(self, detail):
+        QMessageBox.critical(self, "RF Training Error", str(detail))
+        self.set_status("Training failed.", "#c62828")
+
+    def on_training_worker_finished(self):
+        if self.training_worker is not None:
+            self.training_worker.deleteLater()
+            self.training_worker = None
+        self._is_training = False
+        self.update_action_button_states()
 
     def on_load_previous_run(self):
         start_dir = self.visualizer._from_project_relative_path(
-            self.output_dir_edit.text().strip() or "."
+            self.output_dir_edit.text().strip() or "trained_model"
         )
         folder = QFileDialog.getExistingDirectory(self, "Select Saved Training Run Folder", start_dir)
         if not folder:
@@ -2862,10 +3706,12 @@ class EMGVisualizer(QMainWindow):
         self.is_calibrated = False
         self.calibration_active = False
         self.data_buffer = None
+        self.raw_data_buffer = None
         self.baseline_offsets = np.zeros(4, dtype=np.float32)
 
         self.curves = []
         self.plots = []
+        self.plot_rows = []
         self.threshold_lines_pos = []
         self.threshold_lines_neg = []
         self.zero_lines = []
@@ -2926,6 +3772,8 @@ class EMGVisualizer(QMainWindow):
         self.rf_prediction_rate_hz = 0.0
         self.rf_last_prediction_ts = 0.0
         self.rf_samples_since_submit = 0
+        self.rf_valid_sample_count = 0
+        self.rf_last_status_reason = "Model not loaded"
         self.rf_worker = RFRealtimeInferenceWorker(sample_rate=SAMPLE_RATE)
         self.rf_worker.prediction_ready.connect(self.on_rf_prediction_ready)
         self.rf_worker.error_occurred.connect(self.on_rf_worker_error)
@@ -2946,16 +3794,27 @@ class EMGVisualizer(QMainWindow):
         self.task_hold_s = float(DEFAULT_TASK_HOLD_S)
         self.task_rest_s = float(DEFAULT_TASK_REST_S)
         self.task_record_rest = True
+        self.task_session_active = False
         self.timed_record_enabled = False
         self.timed_record_label = ""
         self.timed_record_trial_id = 0
         self.timed_record_phase = ""
-        self.recorded_rows = []
+        self.recorded_batches = []
         self.record_start_unix = 0.0
         self.record_save_dir = DATASET_DIR
         self.last_recorded_csv_path = os.path.join(DATASET_DIR, DEFAULT_RECORD_CSV)
+        self._record_graph_stream_prev_checked = True
+        self._record_live_analysis_prev_enabled = False
+        self.record_save_workers = []
+        self.connection_medium = "wired"
+        self.wired_channel_count = 4
         self.current_port_name = "socket://127.0.0.1:7000"
+        self.current_device = None
+        self.discovered_wireless_devices = []
+        self.wireless_access_key = ""
+        self.keepalive_failures = 0
         self.port_config_dialog = None
+        self.wireless_config_dialog = None
         self.port_config_applied = False
         self.ui_fps = 0.0
         self.data_fps = 0.0
@@ -3280,6 +4139,9 @@ class EMGVisualizer(QMainWindow):
         # --- PLOT REFRESH TIMER ---
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plot)
+        self.keepalive_timer = QTimer(self)
+        self.keepalive_timer.timeout.connect(self.send_wireless_keepalive)
+        self.keepalive_timer.start(KEEPALIVE_INTERVAL_MS)
 
         self.reset_fps_counters()
         self.refresh_ports()
@@ -3329,6 +4191,25 @@ class EMGVisualizer(QMainWindow):
             f"color: {THEME_COLORS['disabled']}; border-color: {THEME_COLORS['panel']}; }}"
         )
 
+    def active_emg_channel_count(self):
+        if self.connection_medium == "wireless":
+            return WIRELESS_EMG_CHANNELS
+        return int(self.num_channels)
+
+    def channel_display_name(self, index):
+        idx = int(index)
+        if self.connection_medium == "wireless" and self.num_channels >= WIRELESS_TOTAL_CHANNELS:
+            if idx == 8:
+                return "ROLL"
+            if idx == 9:
+                return "PITCH"
+            if idx == 10:
+                return "YAW"
+        return f"CH {idx + 1}"
+
+    def is_wireless_imu_channel(self, index):
+        return self.connection_medium == "wireless" and int(index) >= WIRELESS_EMG_CHANNELS
+
     def reset_fps_counters(self):
         self.ui_fps = 0.0
         self.data_fps = 0.0
@@ -3338,6 +4219,20 @@ class EMGVisualizer(QMainWindow):
         self._ui_fps_last_ts = now
         self._data_fps_last_ts = now
         self._refresh_fps_labels(active=False)
+
+    def send_wireless_keepalive(self):
+        if not self.is_connected or self.connection_medium != "wireless":
+            return
+        if self.current_device is None or not self.wireless_access_key:
+            return
+
+        try:
+            ControlProtocol.ping(self.current_device.ip, self.wireless_access_key)
+            self.keepalive_failures = 0
+        except Exception:
+            self.keepalive_failures += 1
+            if self.keepalive_failures >= 3:
+                self.set_status("Wireless keepalive lost", "#f57c00")
 
     def _refresh_fps_labels(self, active=True):
         if not active:
@@ -3394,18 +4289,40 @@ class EMGVisualizer(QMainWindow):
                 self.list_available_ports(),
                 self.current_port_name,
             )
+        if self.wireless_config_dialog and self.wireless_config_dialog.isVisible():
+            selected_ip = self.current_device.ip if self.current_device is not None else ""
+            self.wireless_config_dialog.set_devices(self.discovered_wireless_devices, selected_ip=selected_ip)
+            if self.is_connected and self.connection_medium == "wireless" and self.current_device is not None:
+                self.wireless_config_dialog.set_connection_state(
+                    True,
+                    f"Connected to {self.current_device.summary}. Click Apply to continue.",
+                )
+            else:
+                self.wireless_config_dialog.set_connection_state(False)
 
     def open_port_configuration_dialog(self):
+        mode_dialog = ConnectionModeDialog(self)
+        center_window(mode_dialog, self)
+        if mode_dialog.exec_() != QDialog.Accepted:
+            return
+
+        if mode_dialog.selected_medium == "wireless":
+            self.open_wireless_configuration_dialog()
+        else:
+            self.open_wired_port_configuration_dialog()
+
+    def open_wired_port_configuration_dialog(self):
         if self.port_config_dialog and self.port_config_dialog.isVisible():
             self.port_config_dialog.raise_()
             self.port_config_dialog.activateWindow()
             return
 
-        dlg = PortConfigDialog(self.current_port_name, self.is_connected, self)
+        selected_port = self.current_port_name if not str(self.current_port_name).startswith("wifi://") else ""
+        dlg = PortConfigDialog(selected_port, self.is_connected, self)
         dlg.connect_requested.connect(self.connect_serial)
         dlg.refresh_requested.connect(lambda: self.refresh_ports(dlg.selected_port()))
         self.port_config_dialog = dlg
-        self.refresh_ports()
+        self.refresh_ports(selected_port)
         center_window(dlg, self)
         result = dlg.exec_()
         chosen_port = dlg.selected_port().strip()
@@ -3418,8 +4335,130 @@ class EMGVisualizer(QMainWindow):
             self.port_config_applied = False
         self.sync_calibration_dialog_state()
 
+    def open_usb_wifi_provision_dialog(self):
+        dialog = USBProvisionDialog(self)
+        center_window(dialog, self)
+        if dialog.exec_() == QDialog.Accepted and self.wireless_config_dialog and self.wireless_config_dialog.isVisible():
+            self.discover_wireless_devices(self.wireless_config_dialog)
+
+    def discover_wireless_devices(self, dialog=None):
+        try:
+            devices = ControlProtocol.discover()
+        except Exception as exc:
+            target_dialog = dialog or self.wireless_config_dialog
+            if target_dialog is not None:
+                target_dialog.set_connection_state(False, f"Wireless discovery failed: {exc}")
+            QMessageBox.warning(self, "Wireless Discovery Failed", str(exc))
+            return
+
+        self.discovered_wireless_devices = devices
+        target_dialog = dialog or self.wireless_config_dialog
+        if target_dialog is not None:
+            selected_ip = self.current_device.ip if self.current_device is not None else ""
+            target_dialog.set_devices(devices, selected_ip=selected_ip)
+            if devices:
+                target_dialog.set_connection_state(False, f"Discovered {len(devices)} BioWave wireless device(s).")
+            else:
+                target_dialog.set_connection_state(False, "No BioWave wireless devices replied on the current Wi-Fi.")
+
+    def connect_wireless(self, device, access_key, dialog=None):
+        if device is None:
+            raise RuntimeError("No BioWave wireless device is selected.")
+
+        if self.is_connected:
+            self.disconnect_serial()
+
+        self.live_analysis_enabled = False
+        self.connection_medium = "wireless"
+        self.current_device = device
+        self.wireless_access_key = str(access_key or "").strip()
+        self.keepalive_failures = 0
+        self.channel_count = WIRELESS_TOTAL_CHANNELS
+        self.reset_runtime_state_for_channels(self.channel_count)
+
+        if self.analysis_window is not None:
+            self.analysis_window.close()
+            self.analysis_window = None
+
+        try:
+            self.serial_worker = WirelessStreamWorker(WIFI_STREAM_PORT)
+            self.serial_worker.batch_received.connect(self.on_serial_batch)
+            self.serial_worker.error_occurred.connect(self.on_serial_error)
+            self.serial_worker.start()
+
+            client_ip = get_local_ip_for_target(device.ip)
+            ControlProtocol.start_stream(device.ip, self.wireless_access_key, client_ip, WIFI_STREAM_PORT)
+
+            self.current_port_name = f"wifi://{device.ip}"
+            self.is_connected = True
+            self.port_config_applied = False
+            self.btn_port_config.setStyleSheet(self.connected_port_button_stylesheet())
+            self.btn_disconnect.setEnabled(True)
+            self.btn_calibrate.setEnabled(True)
+            self.btn_analysis.setEnabled(False)
+            self.timer.stop()
+            self.reset_fps_counters()
+            self.set_status("Wireless connected - calibration required", "#ff9800")
+            if self.rf_model is not None:
+                model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+                self.rf_last_status_reason = "Waiting calibrated stream..."
+                self.lbl_rf.setText(f"RF Model: {model_name} | Waiting calibrated stream...")
+                self.lbl_rf.setStyleSheet(themed_label_style("success"))
+            else:
+                self.lbl_rf.setText("RF Model: Not loaded")
+                self.lbl_rf.setStyleSheet(themed_label_style("muted"))
+
+            if dialog is not None:
+                dialog.set_connection_state(True, f"Connected to {device.summary}. Click Apply to continue.")
+            self.sync_port_dialog_state()
+            self.sync_calibration_dialog_state()
+        except Exception:
+            if self.serial_worker:
+                self.serial_worker.stop()
+                self.serial_worker = None
+            self.is_connected = False
+            self.current_device = None
+            self.port_config_applied = False
+            if dialog is not None:
+                dialog.set_connection_state(False, "Wireless connection failed.")
+            raise
+
+    def on_wireless_connect_requested(self, device, access_key):
+        try:
+            self.connect_wireless(device, access_key, self.wireless_config_dialog)
+        except Exception as exc:
+            QMessageBox.critical(self, "Wireless Connection Error", str(exc))
+
+    def open_wireless_configuration_dialog(self):
+        if self.wireless_config_dialog and self.wireless_config_dialog.isVisible():
+            self.wireless_config_dialog.raise_()
+            self.wireless_config_dialog.activateWindow()
+            return
+
+        dlg = WirelessConfigDialog(access_key=self.wireless_access_key, parent=self)
+        dlg.discover_requested.connect(lambda: self.discover_wireless_devices(dlg))
+        dlg.provision_requested.connect(self.open_usb_wifi_provision_dialog)
+        dlg.connect_requested.connect(self.on_wireless_connect_requested)
+        self.wireless_config_dialog = dlg
+        dlg.set_devices(self.discovered_wireless_devices, selected_ip=self.current_device.ip if self.current_device else "")
+        if self.is_connected and self.connection_medium == "wireless" and self.current_device is not None:
+            dlg.set_connection_state(True, f"Connected to {self.current_device.summary}. Click Apply to continue.")
+        else:
+            self.discover_wireless_devices(dlg)
+
+        center_window(dlg, self)
+        result = dlg.exec_()
+        self.wireless_access_key = dlg.access_key_input.text().strip()
+        self.wireless_config_dialog = None
+        if result == QDialog.Accepted and self.is_connected and self.connection_medium == "wireless":
+            self.port_config_applied = True
+        elif not self.is_connected:
+            self.port_config_applied = False
+        self.sync_calibration_dialog_state()
+
     def reset_runtime_state_for_channels(self, num_channels):
         self.num_channels = int(max(1, num_channels))
+        self.raw_data_buffer = np.zeros((self.num_channels, WINDOW_SIZE), dtype=np.float32)
         self.data_buffer = np.zeros((self.num_channels, WINDOW_SIZE), dtype=np.float32)
         self.baseline_offsets = np.zeros(self.num_channels, dtype=np.float32)
         self.latest_mav = np.zeros(self.num_channels, dtype=np.float32)
@@ -3464,6 +4503,8 @@ class EMGVisualizer(QMainWindow):
         self.flex_capture = []
         self.is_calibrated = False
         self.calibration_active = False
+        self.rf_valid_sample_count = 0
+        self.rf_samples_since_submit = 0
 
         self.setup_plots(self.num_channels)
         self.setup_metrics_labels(self.num_channels)
@@ -3482,6 +4523,8 @@ class EMGVisualizer(QMainWindow):
         if self.is_connected:
             return
         self.live_analysis_enabled = False
+        self.connection_medium = "wired"
+        self.current_device = None
 
         if port_name is not None:
             self.current_port_name = str(port_name).strip()
@@ -3491,6 +4534,8 @@ class EMGVisualizer(QMainWindow):
             QMessageBox.warning(self, "No Port", "Please select a valid serial port.")
             return
 
+        self.wired_channel_count = int(max(2, min(9, self.channel_count)))
+        self.channel_count = self.wired_channel_count
         self.reset_runtime_state_for_channels(self.channel_count)
         if self.analysis_window is not None:
             self.analysis_window.close()
@@ -3515,6 +4560,7 @@ class EMGVisualizer(QMainWindow):
             self.set_status("Connected - calibration required", "#ff9800")
             if self.rf_model is not None:
                 model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+                self.rf_last_status_reason = "Waiting calibrated stream..."
                 self.lbl_rf.setText(f"RF Model: {model_name} | Waiting calibrated stream...")
                 self.lbl_rf.setStyleSheet(themed_label_style("success"))
             else:
@@ -3536,6 +4582,13 @@ class EMGVisualizer(QMainWindow):
         self.rf_last_latency_ms = 0.0
         self.rf_prediction_rate_hz = 0.0
         self.rf_last_prediction_ts = 0.0
+        self.rf_valid_sample_count = 0
+
+        if self.connection_medium == "wireless" and self.current_device is not None and self.wireless_access_key:
+            try:
+                ControlProtocol.stop_stream(self.current_device.ip, self.wireless_access_key)
+            except Exception:
+                pass
 
         if self.serial_worker:
             self.serial_worker.stop()
@@ -3549,7 +4602,8 @@ class EMGVisualizer(QMainWindow):
         self.analysis_window = None
         if self.data_collection_dialog and self.data_collection_dialog.isVisible():
             self.data_collection_dialog.cancel_task_protocol(emit_signal=True)
-        self.timed_record_enabled = False
+        self._set_task_collection_mode(False)
+        self.live_analysis_enabled = False
         self.timed_record_label = ""
         self.timed_record_phase = ""
         self.timed_record_trial_id = 0
@@ -3557,6 +4611,8 @@ class EMGVisualizer(QMainWindow):
         self.is_connected = False
         self.is_calibrated = False
         self.port_config_applied = False
+        self.current_device = None
+        self.keepalive_failures = 0
         self.btn_port_config.setStyleSheet(themed_button_style("accent"))
         self.btn_disconnect.setEnabled(False)
         self.btn_calibrate.setEnabled(True)
@@ -3565,6 +4621,7 @@ class EMGVisualizer(QMainWindow):
         self.set_waiting_for_calibration_labels()
         if self.rf_model is not None:
             model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+            self.rf_last_status_reason = "Disconnected"
             self.lbl_rf.setText(f"RF Model: {model_name} | Disconnected")
             self.lbl_rf.setStyleSheet(themed_label_style("success"))
         else:
@@ -3582,7 +4639,7 @@ class EMGVisualizer(QMainWindow):
 
         self.metrics_labels = []
         for i in range(num_channels):
-            label = QLabel(f"CH{i + 1} | Waiting calibration")
+            label = QLabel(f"{self.channel_display_name(i)} | Waiting calibration")
             label.setWordWrap(True)
             label.setStyleSheet("color: #B7C6CC; font-family: Consolas; font-size: 15px;")
             self.metrics_layout.addWidget(label)
@@ -3592,7 +4649,7 @@ class EMGVisualizer(QMainWindow):
 
     def set_waiting_for_calibration_labels(self):
         for i in range(len(self.metrics_labels)):
-            self.metrics_labels[i].setText(f"CH{i + 1} | Waiting calibration")
+            self.metrics_labels[i].setText(f"{self.channel_display_name(i)} | Waiting calibration")
             self.metrics_labels[i].setStyleSheet("color: #B7C6CC; font-family: Consolas; font-size: 15px;")
         self.analysis_idle_labels_active = False
 
@@ -3600,7 +4657,7 @@ class EMGVisualizer(QMainWindow):
         if self.analysis_idle_labels_active:
             return
         for i in range(len(self.metrics_labels)):
-            self.metrics_labels[i].setText(f"CH{i + 1} | Stream ready | Live Analysis OFF")
+            self.metrics_labels[i].setText(f"{self.channel_display_name(i)} | Stream ready | Live Analysis OFF")
             self.metrics_labels[i].setStyleSheet("color: #B7C6CC; font-family: Consolas; font-size: 15px;")
         self.analysis_idle_labels_active = True
 
@@ -3608,6 +4665,7 @@ class EMGVisualizer(QMainWindow):
         self.plot_widget.clear()
         self.curves = []
         self.plots = []
+        self.plot_rows = []
         self.threshold_lines_pos = []
         self.threshold_lines_neg = []
         self.zero_lines = []
@@ -3628,35 +4686,49 @@ class EMGVisualizer(QMainWindow):
         x_max = float(self.x_axis[-1])
         x_span = x_max - x_min
 
-        for i in range(num_channels):
-            p = self.plot_widget.addPlot(row=i, col=0)
-            p.showGrid(x=False, y=True, alpha=0.3)
-            p.setLabel("left", f"CH {i + 1}")
-            left_axis = p.getAxis("left")
-            left_axis.setStyle(autoExpandTextSpace=False, tickTextWidth=Y_AXIS_TICK_TEXT_WIDTH)
+        def configure_plot(plot_item, left_label, show_bottom, is_imu=False):
+            plot_item.showGrid(x=False, y=True, alpha=0.3)
+            plot_item.setLabel("left", left_label)
+            left_axis = plot_item.getAxis("left")
+            left_axis.setStyle(autoExpandTextSpace=False, tickTextWidth=Y_AXIS_TICK_TEXT_WIDTH, showValues=False)
             left_axis.setWidth(Y_AXIS_FIXED_WIDTH)
+            try:
+                tick_font = QFontDatabase.systemFont(QFontDatabase.FixedFont)
+                tick_font.setPointSize(PLOT_AXIS_TICK_FONT_PT)
+                left_axis.setTickFont(tick_font)
+            except Exception:
+                pass
 
-            if i < num_channels - 1:
-                p.hideAxis("bottom")
+            if not show_bottom:
+                plot_item.hideAxis("bottom")
             else:
-                bottom_axis = p.getAxis("bottom")
+                bottom_axis = plot_item.getAxis("bottom")
                 bottom_axis.setStyle(showValues=False)
-                p.setLabel("bottom", "Time (s)")
+                plot_item.setLabel("bottom", "Time (s)")
 
-            # Lock user interaction: no pan/zoom/manual scaling.
-            p.setMouseEnabled(x=False, y=False)
-            p.hideButtons()
-            p.setMenuEnabled(False)
-            p.disableAutoRange(axis="x")
-            p.setLimits(xMin=x_min, xMax=x_max, minXRange=x_span, maxXRange=x_span)
-            p.setXRange(x_min, x_max, padding=0)
-
+            plot_item.setMouseEnabled(x=False, y=False)
+            plot_item.hideButtons()
+            plot_item.setMenuEnabled(False)
+            plot_item.disableAutoRange(axis="x")
+            plot_item.setLimits(xMin=x_min, xMax=x_max, minXRange=x_span, maxXRange=x_span)
+            plot_item.setXRange(x_min, x_max, padding=0)
             if self.check_autoscale.isChecked():
-                p.enableAutoRange(axis="y")
+                plot_item.enableAutoRange(axis="y")
             else:
-                p.setYRange(Y_MIN, Y_MAX)
+                plot_item.disableAutoRange(axis="y")
+                if is_imu:
+                    plot_item.setYRange(IMU_Y_MIN, IMU_Y_MAX, padding=0)
+                else:
+                    plot_item.setYRange(Y_MIN, Y_MAX, padding=0)
 
-            curve = p.plot(pen=pg.mkPen(colors[i % len(colors)], width=2))
+        def add_emg_plot(row_index, channel_index, show_bottom):
+            p = self.plot_widget.addPlot(row=row_index, col=0)
+            configure_plot(p, self.channel_display_name(channel_index), show_bottom, is_imu=False)
+            try:
+                p.setMinimumHeight(52)
+            except Exception:
+                pass
+            curve = p.plot(pen=pg.mkPen(colors[channel_index % len(colors)], width=2))
             threshold_line_pos = pg.InfiniteLine(
                 pos=threshold,
                 angle=0,
@@ -3681,30 +4753,243 @@ class EMGVisualizer(QMainWindow):
 
             self.curves.append(curve)
             self.plots.append(p)
+            self.plot_rows.append({"kind": "single", "plot": p, "channel": channel_index, "curve": curve, "is_imu": False})
             self.threshold_lines_pos.append(threshold_line_pos)
             self.threshold_lines_neg.append(threshold_line_neg)
             self.zero_lines.append(zero_line)
 
-    def toggle_autoscale(self):
-        if not self.plots:
+        if self.connection_medium == "wireless" and num_channels >= WIRELESS_TOTAL_CHANNELS:
+            for i in range(WIRELESS_EMG_CHANNELS):
+                add_emg_plot(i, i, show_bottom=False)
+
+            imu_row = WIRELESS_EMG_CHANNELS
+            p = self.plot_widget.addPlot(row=imu_row, col=0, rowspan=3)
+            configure_plot(p, "IMU", show_bottom=True, is_imu=True)
+            try:
+                p.setMinimumHeight(150)
+            except Exception:
+                pass
+            p.addLegend(offset=(8, 8))
+            imu_curves = [
+                p.plot(pen=pg.mkPen("#d32f2f", width=2), name="Roll"),
+                p.plot(pen=pg.mkPen("#2e7d32", width=2), name="Pitch"),
+                p.plot(pen=pg.mkPen("#1565c0", width=2), name="Yaw"),
+            ]
+            zero_line = pg.InfiniteLine(
+                pos=0.0,
+                angle=0,
+                movable=False,
+                pen=pg.mkPen(THEME_COLORS["accent"], width=1),
+            )
+            p.addItem(zero_line)
+            self.plots.append(p)
+            self.plot_rows.append(
+                {
+                    "kind": "imu_combined",
+                    "plot": p,
+                    "channels": [WIRELESS_EMG_CHANNELS, WIRELESS_EMG_CHANNELS + 1, WIRELESS_EMG_CHANNELS + 2],
+                    "curves": imu_curves,
+                    "is_imu": True,
+                }
+            )
+            self.threshold_lines_pos.extend([None, None, None])
+            self.threshold_lines_neg.extend([None, None, None])
+            self.zero_lines.extend([zero_line, zero_line, zero_line])
+            QTimer.singleShot(0, self.apply_plot_row_layout)
             return
-        is_auto = self.check_autoscale.isChecked()
-        for p in self.plots:
-            if is_auto:
-                p.enableAutoRange(axis="y")
-            else:
-                p.disableAutoRange(axis="y")
-                p.setYRange(Y_MIN, Y_MAX)
+
+        for i in range(num_channels):
+            add_emg_plot(i, i, show_bottom=(i == num_channels - 1))
+        QTimer.singleShot(0, self.apply_plot_row_layout)
+
+    def apply_plot_row_layout(self):
+        if not self.plot_rows:
+            return
+
+        try:
+            grid = self.plot_widget.ci.layout
+        except Exception:
+            return
+
+        if self.connection_medium == "wireless" and any(row["kind"] == "imu_combined" for row in self.plot_rows):
+            logical_row_count = WIRELESS_TOTAL_CHANNELS
+            viewport_height = int(self.plot_widget.viewport().height()) - 8
+            if viewport_height <= 0:
+                return
+            slot_height = max(42, int(viewport_height / logical_row_count))
+            imu_height = slot_height * 3
+
+            for row_index in range(logical_row_count):
+                try:
+                    grid.setRowStretchFactor(row_index, 1)
+                    grid.setRowMinimumHeight(row_index, max(26, int(slot_height * 0.6)))
+                    grid.setRowPreferredHeight(row_index, slot_height)
+                except Exception:
+                    pass
+
+            for row in self.plot_rows:
+                try:
+                    if row["kind"] == "imu_combined":
+                        row["plot"].setMinimumHeight(max(120, int(imu_height * 0.82)))
+                    else:
+                        row["plot"].setMinimumHeight(max(40, int(slot_height * 0.75)))
+                except Exception:
+                    pass
+            return
+
+        row_count = max(1, len(self.plot_rows))
+        viewport_height = int(self.plot_widget.viewport().height()) - 8
+        if viewport_height <= 0:
+            return
+        row_height = max(54, int(viewport_height / row_count))
+
+        for row_index in range(row_count):
+            try:
+                grid.setRowStretchFactor(row_index, 1)
+                grid.setRowMinimumHeight(row_index, max(26, int(row_height * 0.65)))
+                grid.setRowPreferredHeight(row_index, row_height)
+            except Exception:
+                pass
+
+        for row in self.plot_rows:
+            try:
+                row["plot"].setMinimumHeight(max(40, int(row_height * 0.8)))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _format_axis_tick(value, magnitude_only=False):
+        value = float(value)
+        if abs(value) < 1e-6:
+            return "0"
+        tick_value = abs(value) if magnitude_only else value
+        if abs(tick_value - round(tick_value)) < 0.05:
+            return str(int(round(tick_value)))
+        if abs(tick_value) >= 100.0:
+            return f"{tick_value:.0f}"
+        if abs(tick_value) >= 10.0:
+            return f"{tick_value:.1f}"
+        return f"{tick_value:.2f}"
+
+    def _set_plot_axis_ticks(self, plot_item, tick_values, magnitude_only=False):
+        ticks = []
+        seen = set()
+        for value in tick_values:
+            if value is None or not np.isfinite(value):
+                continue
+            numeric = float(value)
+            key = round(numeric, 6)
+            if key in seen:
+                continue
+            seen.add(key)
+            ticks.append((numeric, self._format_axis_tick(numeric, magnitude_only=magnitude_only)))
+
+        if not ticks:
+            return
+
+        ticks.sort(key=lambda item: item[0])
+        plot_item.getAxis("left").setTicks([ticks])
+
+    def _set_fixed_plot_y_range(self, plot_item, is_imu=False):
+        y_min = IMU_Y_MIN if is_imu else Y_MIN
+        y_max = IMU_Y_MAX if is_imu else Y_MAX
+        plot_item.disableAutoRange(axis="y")
+        plot_item.setYRange(y_min, y_max, padding=0)
+        self._set_plot_axis_ticks(plot_item, [y_min, 0.0, y_max], magnitude_only=not is_imu)
+
+    @staticmethod
+    def _center_emg_series_for_display(values):
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.size == 0:
+            return arr.copy()
+
+        centered = arr.copy()
+        finite = centered[np.isfinite(centered)]
+        if finite.size == 0:
+            return centered
+
+        centered -= float(np.median(finite))
+        return centered
+
+    def _emg_display_values(self, channel_index):
+        if self.data_buffer is None:
+            return None
+        return self._center_emg_series_for_display(self.data_buffer[int(channel_index)])
+
+    def _apply_live_emg_y_range(self, plot_item, values):
+        arr = np.asarray(values, dtype=np.float32)
+        if arr.size == 0:
+            self._set_fixed_plot_y_range(plot_item, is_imu=False)
+            return
+
+        finite = arr[np.isfinite(arr)]
+        if finite.size == 0:
+            self._set_fixed_plot_y_range(plot_item, is_imu=False)
+            return
+
+        data_min = float(np.min(finite))
+        data_max = float(np.max(finite))
+        amplitude = max(abs(data_min), abs(data_max), LIVE_Y_MIN_HALF_RANGE)
+        pad = max(1.5, amplitude * LIVE_Y_PADDING_RATIO)
+        plot_half = amplitude + pad
+
+        plot_item.disableAutoRange(axis="y")
+        plot_item.setYRange(-plot_half, plot_half, padding=0)
+        plot_item.getAxis("left").setTicks(
+            [[
+                (-plot_half, self._format_axis_tick(data_min, magnitude_only=True)),
+                (0.0, "0"),
+                (plot_half, self._format_axis_tick(data_max, magnitude_only=True)),
+            ]]
+        )
+
+    def refresh_live_plot_ranges(self):
+        if not self.plot_rows:
+            return
+
+        for row in self.plot_rows:
+            if row["kind"] == "single":
+                if not self.check_autoscale.isChecked() or self.data_buffer is None:
+                    self._set_fixed_plot_y_range(row["plot"], is_imu=False)
+                    continue
+
+                values = self._emg_display_values(int(row["channel"]))
+                if values is not None:
+                    self._apply_live_emg_y_range(row["plot"], values)
+                continue
+
+            if row.get("is_imu"):
+                if self.check_autoscale.isChecked():
+                    row["plot"].enableAutoRange(axis="y")
+                else:
+                    self._set_fixed_plot_y_range(row["plot"], is_imu=True)
+
+    def toggle_autoscale(self):
+        if not self.plot_rows:
+            return
+        self.refresh_live_plot_ranges()
 
     def update_threshold_overlays(self, _value=None):
         threshold = self.threshold_spin.value()
         for line in self.threshold_lines_pos:
-            line.setValue(threshold)
+            if line is not None:
+                line.setValue(threshold)
         for line in self.threshold_lines_neg:
-            line.setValue(-threshold)
+            if line is not None:
+                line.setValue(-threshold)
 
     def apply_channel_count_from_dialog(self, count):
-        new_count = int(max(1, min(9, count)))
+        if self.connection_medium == "wireless":
+            QMessageBox.information(
+                self,
+                "Wireless Channel Layout",
+                "Wireless mode uses a fixed 11-channel layout: 8 EMG channels plus Roll, Pitch, and Yaw.",
+            )
+            self.channel_count = WIRELESS_TOTAL_CHANNELS
+            self.sync_calibration_dialog_state()
+            return
+
+        new_count = int(max(2, min(9, count)))
         if not (self.is_connected and self.port_config_applied):
             QMessageBox.information(
                 self,
@@ -3718,6 +5003,7 @@ class EMGVisualizer(QMainWindow):
             return
 
         self.channel_count = new_count
+        self.wired_channel_count = new_count
         port_name = (self.current_port_name or "").strip()
         if not port_name:
             QMessageBox.warning(self, "No Port", "No active port found. Configure port first.")
@@ -3834,21 +5120,73 @@ class EMGVisualizer(QMainWindow):
     def on_realtime_classification_window_closed(self):
         self.realtime_classification_window = None
 
+    @staticmethod
+    def expected_rf_feature_count(num_channels):
+        n_ch = int(max(1, num_channels))
+        per_channel_features = 15
+        rms_ratio_features = n_ch
+        corr_features = (n_ch * (n_ch - 1)) // 2
+        return int((per_channel_features * n_ch) + rms_ratio_features + corr_features)
+
+    @staticmethod
+    def infer_rf_input_channels_from_feature_count(feature_count):
+        try:
+            target = int(feature_count)
+        except Exception:
+            return 0
+        for n_ch in range(1, 65):
+            if EMGVisualizer.expected_rf_feature_count(n_ch) == target:
+                return n_ch
+        return 0
+
+    def set_rf_status_reason(self, reason, style_kind="success"):
+        reason_text = str(reason or "").strip()
+        self.rf_last_status_reason = reason_text
+        if self.rf_model is None:
+            self.lbl_rf.setText("RF Model: Not loaded")
+            self.lbl_rf.setStyleSheet(themed_label_style("muted"))
+            return
+        model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
+        if reason_text:
+            self.lbl_rf.setText(f"RF Model: {model_name} | {reason_text}")
+        else:
+            self.lbl_rf.setText(
+                f"RF Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
+            )
+        self.lbl_rf.setStyleSheet(themed_label_style(style_kind))
+
     def request_realtime_prediction(self):
         if self.rf_model is None or self.rf_worker is None:
+            self.rf_last_status_reason = "Model not loaded"
             return
-        if not self.is_connected or not self.is_calibrated or self.data_buffer is None:
+        if self.task_session_active:
+            self.set_rf_status_reason("Paused during data collection", "muted")
+            return
+        if not self.is_connected or not self.is_calibrated or self.raw_data_buffer is None:
+            self.set_rf_status_reason("Waiting calibrated stream...", "success")
             return
         model_ch = int(max(1, self.rf_model_input_channels))
-        if self.data_buffer.shape[0] < model_ch:
+        if self.raw_data_buffer.shape[0] < model_ch:
+            self.set_rf_status_reason(
+                f"Incompatible channels (needs {model_ch}, stream has {self.raw_data_buffer.shape[0]})",
+                "muted",
+            )
             return
-        n_avail = self.data_buffer.shape[1]
+        n_avail = int(min(self.rf_valid_sample_count, self.raw_data_buffer.shape[1]))
         if n_avail < self.rf_window_samples:
+            self.set_rf_status_reason(
+                f"Buffering stream ({n_avail}/{self.rf_window_samples} samples)",
+                "success",
+            )
             return
-        win = np.ascontiguousarray(self.data_buffer[:model_ch, -self.rf_window_samples:].T, dtype=np.float32)
+        win = np.ascontiguousarray(self.raw_data_buffer[:model_ch, -self.rf_window_samples:].T, dtype=np.float32)
+        self.rf_last_status_reason = ""
         self.rf_worker.submit_window(win)
 
     def schedule_realtime_prediction(self, new_samples):
+        if self.task_session_active:
+            self.rf_samples_since_submit = 0
+            return
         self.rf_samples_since_submit += int(max(0, new_samples))
         stride = int(max(1, self.rf_stride_samples))
         if self.rf_samples_since_submit < stride:
@@ -3869,6 +5207,7 @@ class EMGVisualizer(QMainWindow):
         self.rf_last_pred_conf = float(np.clip(pred_conf, 0.0, 1.0))
         self.rf_last_class_confidences = conf_arr
         self.rf_last_latency_ms = float(max(0.0, data.get("latency_ms", 0.0)))
+        self.rf_last_status_reason = ""
 
         now_ts = float(data.get("completed_ts", time.perf_counter()))
         if self.rf_last_prediction_ts > 0.0:
@@ -3889,7 +5228,7 @@ class EMGVisualizer(QMainWindow):
             )
             self.lbl_rf.setStyleSheet(themed_label_style("success"))
 
-    def on_rf_worker_error(self, _message):
+    def on_rf_worker_error(self, message):
         # Keep UI responsive on worker errors; next valid batch can recover state.
         self.rf_last_pred_label = "N/A"
         self.rf_last_pred_conf = 0.0
@@ -3898,6 +5237,10 @@ class EMGVisualizer(QMainWindow):
         self.rf_prediction_rate_hz = 0.0
         self.rf_last_prediction_ts = 0.0
         self.rf_samples_since_submit = 0
+        detail = str(message or "Unknown RF worker error").strip()
+        if len(detail) > 180:
+            detail = detail[:177] + "..."
+        self.set_rf_status_reason(f"Prediction error: {detail}", "muted")
 
     def get_realtime_classification_payload(self):
         model_loaded = self.rf_model is not None
@@ -3905,9 +5248,12 @@ class EMGVisualizer(QMainWindow):
         model_path_text = self._to_project_relative_path(self.rf_model_path) if self.rf_model_path else "N/A"
 
         if model_loaded:
-            model_status_text = (
-                f"Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
-            )
+            if self.rf_last_status_reason:
+                model_status_text = f"Model: {model_name} | {self.rf_last_status_reason}"
+            else:
+                model_status_text = (
+                    f"Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
+                )
         else:
             model_status_text = "Model: Not loaded"
 
@@ -3923,6 +5269,7 @@ class EMGVisualizer(QMainWindow):
             f"Window samples: {int(self.rf_window_samples)}",
             f"Stride samples: {int(self.rf_stride_samples)}",
             f"Input channels: {int(self.rf_model_input_channels)}",
+            f"Buffered samples: {int(self.rf_valid_sample_count)}/{int(self.rf_window_samples)}",
             f"Classes: {len(classes)}",
         ]
         return {
@@ -3948,6 +5295,8 @@ class EMGVisualizer(QMainWindow):
             self.rf_last_latency_ms = 0.0
             self.rf_prediction_rate_hz = 0.0
             self.rf_last_prediction_ts = 0.0
+            self.rf_valid_sample_count = 0
+            self.rf_last_status_reason = "Model not loaded"
             self.lbl_rf.setText("RF Model: Not loaded")
             self.lbl_rf.setStyleSheet(themed_label_style("muted"))
             return
@@ -3959,6 +5308,13 @@ class EMGVisualizer(QMainWindow):
                 f"(needs {self.rf_model_input_channels}, stream has {self.data_buffer.shape[0]})"
             )
             self.lbl_rf.setStyleSheet(themed_label_style("muted"))
+            self.rf_last_status_reason = (
+                f"Incompatible channels (needs {self.rf_model_input_channels}, stream has {self.data_buffer.shape[0]})"
+            )
+            return
+        if self.rf_last_status_reason:
+            self.lbl_rf.setText(f"RF Model: {model_name} | {self.rf_last_status_reason}")
+            self.lbl_rf.setStyleSheet(themed_label_style("success"))
             return
         self.lbl_rf.setText(
             f"RF Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
@@ -3989,16 +5345,57 @@ class EMGVisualizer(QMainWindow):
     def load_rf_model(self, path):
         try:
             artifact = joblib.load(path)
+            self.apply_rf_model_artifact(artifact, path)
+        except Exception as e:
+            QMessageBox.critical(self, "RF Model Load Error", str(e))
+
+    def apply_rf_model_artifact(self, artifact, path=""):
+        try:
             if not isinstance(artifact, dict) or "model" not in artifact:
                 raise ValueError("Artifact must be a dict with key 'model'.")
 
-            self.rf_model = artifact["model"]
-            self.rf_class_names = list(artifact.get("class_names", []))
+            model = artifact["model"]
+            class_names = list(artifact.get("class_names", artifact.get("classes", [])))
+            if not class_names and hasattr(model, "classes_"):
+                class_names = [str(x) for x in list(getattr(model, "classes_", []))]
+
+            artifact_input_channels = artifact.get("input_channels", None)
+            model_feature_count = int(getattr(model, "n_features_in_", 0) or 0)
+            if model_feature_count <= 0:
+                try:
+                    model_feature_count = int(len(artifact.get("feature_names", []) or []))
+                except Exception:
+                    model_feature_count = 0
+            if artifact_input_channels is None and model_feature_count > 0:
+                inferred_channels = self.infer_rf_input_channels_from_feature_count(model_feature_count)
+                input_channels = inferred_channels if inferred_channels > 0 else 4
+            else:
+                try:
+                    input_channels = int(artifact_input_channels if artifact_input_channels is not None else 4)
+                except Exception:
+                    input_channels = 4
+                input_channels = int(max(1, input_channels))
+
+            expected_features = self.expected_rf_feature_count(input_channels)
+            if model_feature_count > 0 and model_feature_count != expected_features:
+                inferred_channels = self.infer_rf_input_channels_from_feature_count(model_feature_count)
+                if artifact_input_channels is None and inferred_channels > 0:
+                    input_channels = inferred_channels
+                    expected_features = self.expected_rf_feature_count(input_channels)
+                else:
+                    raise ValueError(
+                        "Model feature count does not match artifact channel metadata. "
+                        f"Model expects {model_feature_count} feature(s), but {input_channels} channel(s) "
+                        f"produce {expected_features}. Load a matching model or retrain from the current dataset."
+                    )
+
+            self.rf_model = model
+            self.rf_class_names = [str(x) for x in class_names]
             self.rf_window_samples = int(max(8, artifact.get("window_samples", 100)))
             self.rf_stride_samples = int(max(1, artifact.get("stride_samples", 1)))
             self.rf_model_created_at_text = str(artifact.get("created_at_text", "N/A"))
             self.rf_model_sample_rate = int(artifact.get("sample_rate", SAMPLE_RATE))
-            self.rf_model_input_channels = int(max(1, artifact.get("input_channels", 4)))
+            self.rf_model_input_channels = int(max(1, input_channels))
             self.rf_model_path = path
             self.rf_last_pred_label = "N/A"
             self.rf_last_pred_conf = 0.0
@@ -4007,19 +5404,19 @@ class EMGVisualizer(QMainWindow):
             self.rf_prediction_rate_hz = 0.0
             self.rf_last_prediction_ts = 0.0
             self.rf_samples_since_submit = 0
+            self.rf_last_status_reason = (
+                f"Loaded | Ch: {self.rf_model_input_channels} | Window: {self.rf_window_samples} samples"
+            )
             if self.rf_worker is not None:
-                self.rf_worker.set_model(self.rf_model, self.rf_class_names)
+                self.rf_worker.set_model(self.rf_model, self.rf_class_names, sample_rate=self.rf_model_sample_rate)
             self.request_realtime_prediction()
 
-            model_name = os.path.basename(path)
-            self.lbl_rf.setText(
-                f"RF Model: {model_name} | Ch: {self.rf_model_input_channels} | "
-                f"Window: {self.rf_window_samples} samples | Classes: {len(self.rf_class_names)}"
-            )
-            self.lbl_rf.setStyleSheet(themed_label_style("success"))
-
-        except Exception as e:
-            QMessageBox.critical(self, "RF Model Load Error", str(e))
+            if self.rf_last_status_reason:
+                self.set_rf_status_reason(self.rf_last_status_reason, "success")
+            else:
+                self.set_rf_status_reason("Prediction queued...", "success")
+        except Exception:
+            raise
 
     def data_collection_settings_payload(self):
         return {
@@ -4142,6 +5539,10 @@ class EMGVisualizer(QMainWindow):
         return [name for _idx, name in cols]
 
     @staticmethod
+    def _record_channel_columns():
+        return [f"Ch{i}" for i in range(1, WIRELESS_TOTAL_CHANNELS + 1)]
+
+    @staticmethod
     def _channel_columns_from_rows(rows):
         seen = set()
         cols = []
@@ -4160,6 +5561,26 @@ class EMGVisualizer(QMainWindow):
         return [name for _idx, name in cols]
 
     @classmethod
+    def _active_channel_columns_from_csv(cls, path):
+        channel_cols = []
+        active = set()
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames is None:
+                raise ValueError("CSV has no header.")
+            channel_cols = cls._channel_columns_from_fieldnames(reader.fieldnames)
+            for row in reader:
+                for ch_name in channel_cols:
+                    raw_val = row.get(ch_name, "")
+                    if str(raw_val).strip() != "":
+                        active.add(ch_name)
+        if not channel_cols:
+            return []
+        if not active:
+            return list(channel_cols)
+        return [name for name in channel_cols if name in active]
+
+    @classmethod
     def detect_training_csv_channel_count(cls, path):
         csv_path = cls._from_project_relative_path(path)
         if not csv_path or not os.path.isfile(csv_path):
@@ -4171,12 +5592,23 @@ class EMGVisualizer(QMainWindow):
             field_map = {str(name).strip().lower(): str(name).strip() for name in list(reader.fieldnames)}
             if "label" not in field_map:
                 raise ValueError("CSV missing required column: Label")
-            channel_cols = cls._channel_columns_from_fieldnames(reader.fieldnames)
+            channel_cols = cls._active_channel_columns_from_csv(csv_path)
             if len(channel_cols) == 0:
                 raise ValueError("CSV must contain channel columns (Ch1..ChN)")
             return int(len(channel_cols))
 
-    def save_recorded_metadata_txt(self, path, data_csv_path, root_dir):
+    def recorded_sample_count(self, batches=None):
+        total = 0
+        for batch in list(self.recorded_batches if batches is None else batches):
+            try:
+                data = np.asarray(batch.data)
+            except Exception:
+                data = np.asarray([])
+            if data.ndim == 2:
+                total += int(data.shape[0])
+        return int(total)
+
+    def build_recorded_metadata_lines(self, data_csv_path, root_dir, sample_count):
         labels = [str(x).strip() for x in self.task_labels if str(x).strip()]
         root_abs = os.path.abspath(root_dir or ".")
         data_abs = os.path.abspath(data_csv_path)
@@ -4184,7 +5616,8 @@ class EMGVisualizer(QMainWindow):
             data_rel = os.path.relpath(data_abs, root_abs).replace("\\", "/")
         except ValueError:
             data_rel = os.path.basename(data_csv_path)
-        lines = [
+        sample_eval = self.evaluate_recording_sample_coverage(int(sample_count))
+        return [
             f"created_at={time.strftime('%Y-%m-%d %H:%M:%S')}",
             f"contributor={self.contributor_name}",
             f"agreement={bool(self.contribution_agreed)}",
@@ -4196,16 +5629,133 @@ class EMGVisualizer(QMainWindow):
             f"rest_s={float(self.task_rest_s)}",
             f"record_rest={bool(self.task_record_rest)}",
             f"channel_count={int(self.num_channels)}",
+            f"connection_medium={self.connection_medium}",
             f"sample_rate_hz={int(SAMPLE_RATE)}",
-            f"num_samples={len(self.recorded_rows)}",
+            f"num_samples={int(sample_count)}",
             f"expected_num_samples={int(self.expected_recorded_samples())}",
-            f"sample_coverage_pct={self.evaluate_recording_sample_coverage(len(self.recorded_rows))['sample_ratio_pct']:.2f}",
+            f"sample_coverage_pct={sample_eval['sample_ratio_pct']:.2f}",
+            f"csv_signal_mode=raw",
+            f"csv_columns=Timestamp_ms,Packet_Number,Trial_ID,{','.join(self._record_channel_columns())},Label",
             f"data_file={os.path.basename(data_csv_path)}",
             f"data_path={data_rel}",
         ]
+
+    def save_recorded_metadata_txt(self, path, data_csv_path, root_dir, sample_count=None):
+        lines = self.build_recorded_metadata_lines(
+            data_csv_path,
+            root_dir,
+            self.recorded_sample_count() if sample_count is None else int(sample_count),
+        )
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
+
+    def _set_task_collection_mode(self, active):
+        active = bool(active)
+        if active:
+            if not self.task_session_active:
+                self._record_graph_stream_prev_checked = bool(self.check_graph_stream.isChecked())
+                self._record_live_analysis_prev_enabled = bool(self.live_analysis_enabled)
+            self.task_session_active = True
+            self.check_graph_stream.setChecked(False)
+            self.live_analysis_enabled = False
+            self.btn_analysis.setEnabled(False)
+            self.rf_samples_since_submit = 0
+            if self.rf_model is not None:
+                self.set_rf_status_reason("Paused during data collection", "muted")
+            if self.analysis_window and self.analysis_window.isVisible():
+                self.set_analysis_idle_labels()
+            return
+
+        was_active = self.task_session_active
+        self.task_session_active = False
+        self.timed_record_enabled = False
+        self.rf_samples_since_submit = 0
+        if was_active:
+            self.check_graph_stream.setChecked(bool(self._record_graph_stream_prev_checked))
+            self.live_analysis_enabled = bool(self._record_live_analysis_prev_enabled)
+        self.btn_analysis.setEnabled(self.is_connected and self.is_calibrated)
+        if self.rf_model is not None:
+            self.request_realtime_prediction()
+            if not self.rf_last_status_reason:
+                self.set_rf_status_reason("Prediction queued...", "success")
+
+    def _on_record_save_completed(self, worker, context, result):
+        if worker in self.record_save_workers:
+            self.record_save_workers.remove(worker)
+        try:
+            worker.wait(50)
+        except Exception:
+            pass
+        worker.deleteLater()
+
+        payload = dict(result or {})
+        if not payload.get("ok", False):
+            self.set_status("Task finished but CSV save failed.", "#f44336")
+            QMessageBox.warning(self, "CSV Save", f"Task finished but CSV save failed:\n{payload.get('error', 'Unknown error')}")
+            return
+
+        data_csv_path = str(payload.get("data_csv_path", "")).strip()
+        self.last_recorded_csv_path = data_csv_path or self.last_recorded_csv_path
+        self.record_save_dir = str(context.get("root_dir", self.record_save_dir) or self.record_save_dir)
+        if self.data_collection_dialog and self.data_collection_dialog.isVisible():
+            self.data_collection_dialog.set_csv_dir(self.record_save_dir)
+
+        if context.get("show_saved_dialog"):
+            QMessageBox.information(self, "Saved", f"Recorded CSV saved:\n{data_csv_path}")
+
+        sample_eval = context.get("sample_eval")
+        if not isinstance(sample_eval, dict):
+            self.set_status("Recorded CSV saved.", "#2e7d32")
+            return
+
+        summary = (
+            f"Data collection session complete | "
+            f"Samples: {sample_eval['actual_samples']}/{sample_eval['expected_samples']} "
+            f"({sample_eval['sample_ratio_pct']:.1f}%) | "
+            f"Est. rate: {sample_eval['effective_hz']:.1f} Hz"
+        )
+        if sample_eval.get("below_threshold", False):
+            self.set_status(summary, "#f57c00")
+            QMessageBox.warning(
+                self,
+                "Low Effective Sampling",
+                (
+                    "Recorded sample count is lower than expected.\n\n"
+                    f"Expected samples: {sample_eval['expected_samples']}\n"
+                    f"Actual samples: {sample_eval['actual_samples']}\n"
+                    f"Coverage: {sample_eval['sample_ratio_pct']:.1f}%\n"
+                    f"Estimated effective rate: {sample_eval['effective_hz']:.1f} Hz\n"
+                    f"Configured rate: {int(SAMPLE_RATE)} Hz\n\n"
+                    "This can reduce training windows and model quality."
+                ),
+            )
+        else:
+            self.set_status(summary, "#2e7d32")
+
+    def queue_recorded_csv_save(self, path, batches=None, sample_eval=None, show_saved_dialog=False):
+        batches_to_save = list(self.recorded_batches if batches is None else batches)
+        if self.recorded_sample_count(batches_to_save) <= 0:
+            raise ValueError("No recorded samples available.")
+
+        data_csv_path, metadata_path, root_dir = self._resolve_record_output_paths(path)
+        metadata_lines = self.build_recorded_metadata_lines(
+            data_csv_path,
+            root_dir,
+            self.recorded_sample_count(batches_to_save),
+        )
+        worker = RecordedCsvSaveWorker(batches_to_save, data_csv_path, metadata_path, metadata_lines, self)
+        context = {
+            "root_dir": root_dir,
+            "sample_eval": sample_eval,
+            "show_saved_dialog": bool(show_saved_dialog),
+        }
+        worker.save_completed.connect(
+            lambda result, w=worker, ctx=context: self._on_record_save_completed(w, ctx, result)
+        )
+        self.record_save_workers.append(worker)
+        worker.start(QThread.LowPriority)
+        return data_csv_path, metadata_path
 
     def start_task_timer_recording(self):
         if not self.data_collection_dialog or not self.data_collection_dialog.isVisible():
@@ -4233,7 +5783,7 @@ class EMGVisualizer(QMainWindow):
             QMessageBox.warning(self, "Task Labels", "Provide at least one gesture label.")
             return
 
-        self.recorded_rows = []
+        self.recorded_batches = []
         self.record_start_unix = time.time()
         self.timed_record_enabled = False
         self.timed_record_label = ""
@@ -4251,6 +5801,8 @@ class EMGVisualizer(QMainWindow):
         if not started:
             QMessageBox.warning(self, "Task Timer", "Unable to start task session.")
             return
+        self._set_task_collection_mode(True)
+        self.set_status("Task Timer: session started | live graph paused for stable capture", "#00897b")
 
     def on_task_phase_started(self, label, trial_id, phase_name, record_enabled):
         self.timed_record_label = str(label)
@@ -4264,43 +5816,22 @@ class EMGVisualizer(QMainWindow):
         )
 
     def on_task_protocol_finished(self):
-        self.timed_record_enabled = False
+        self._set_task_collection_mode(False)
         self.timed_record_label = ""
         self.timed_record_phase = ""
         self.timed_record_trial_id = 0
 
+        sample_count = self.recorded_sample_count()
+        sample_eval = self.evaluate_recording_sample_coverage(sample_count)
         save_path = self.build_auto_record_csv_path()
         try:
-            self.save_recorded_csv(save_path)
-            sample_eval = self.evaluate_recording_sample_coverage(len(self.recorded_rows))
-            summary = (
-                f"Data collection session complete | "
-                f"Samples: {sample_eval['actual_samples']}/{sample_eval['expected_samples']} "
-                f"({sample_eval['sample_ratio_pct']:.1f}%) | "
-                f"Est. rate: {sample_eval['effective_hz']:.1f} Hz"
-            )
-            if sample_eval["below_threshold"]:
-                self.set_status(summary, "#f57c00")
-                QMessageBox.warning(
-                    self,
-                    "Low Effective Sampling",
-                    (
-                        "Recorded sample count is lower than expected.\n\n"
-                        f"Expected samples: {sample_eval['expected_samples']}\n"
-                        f"Actual samples: {sample_eval['actual_samples']}\n"
-                        f"Coverage: {sample_eval['sample_ratio_pct']:.1f}%\n"
-                        f"Estimated effective rate: {sample_eval['effective_hz']:.1f} Hz\n"
-                        f"Configured rate: {int(SAMPLE_RATE)} Hz\n\n"
-                        "This can reduce training windows and model quality."
-                    ),
-                )
-            else:
-                self.set_status(summary, "#2e7d32")
+            self.queue_recorded_csv_save(save_path, sample_eval=sample_eval)
+            self.set_status("Task complete - saving CSV in background...", "#00897b")
         except Exception as e:
             QMessageBox.warning(self, "CSV Save", f"Task finished but CSV save failed:\n{e}")
 
     def on_task_protocol_canceled(self):
-        self.timed_record_enabled = False
+        self._set_task_collection_mode(False)
         self.timed_record_label = ""
         self.timed_record_phase = ""
         self.timed_record_trial_id = 0
@@ -4339,30 +5870,36 @@ class EMGVisualizer(QMainWindow):
             "below_threshold": bool(ratio < float(MIN_RECORD_SAMPLE_RATIO)),
         }
 
-    def append_record_batch(self, centered_batch):
+    def append_record_batch(self, raw_batch, packet_numbers=None):
         if not self.timed_record_enabled:
             return
-        if centered_batch is None or centered_batch.size == 0:
+        if raw_batch is None or raw_batch.size == 0:
             return
 
+        arr = np.asarray(raw_batch, dtype=np.float32)
+        if arr.ndim != 2 or arr.shape[0] <= 0:
+            return
+        n = arr.shape[0]
         now = time.time()
         base_ms = (now - self.record_start_unix) * 1000.0
-        n = centered_batch.shape[0]
-        for i in range(n):
-            row = centered_batch[i]
-            item = {
-                "Timestamp_ms": float(base_ms + (i * (1000.0 / SAMPLE_RATE))),
-                "Label": self.timed_record_label,
-                "Trial_ID": self.timed_record_trial_id,
-                "Phase": self.timed_record_phase,
-            }
-            max_ch = min(int(self.num_channels), int(row.shape[0]))
-            for ch_idx in range(max_ch):
-                item[f"Ch{ch_idx + 1}"] = float(row[ch_idx])
-            self.recorded_rows.append(item)
+        timestamps_ms = base_ms + (np.arange(n, dtype=np.float32) * np.float32(1000.0 / SAMPLE_RATE))
+        packet_src = np.asarray(packet_numbers if packet_numbers is not None else [], dtype=np.int64).reshape(-1)
+        packet_arr = np.full(n, -1, dtype=np.int64)
+        if packet_src.size > 0:
+            packet_arr[: min(n, packet_src.size)] = packet_src[: min(n, packet_src.size)]
+
+        self.recorded_batches.append(
+            TimedRecordBatch(
+                timestamps_ms=np.asarray(timestamps_ms, dtype=np.float32),
+                packet_numbers=packet_arr,
+                trial_id=int(self.timed_record_trial_id),
+                label=str(self.timed_record_label),
+                data=np.ascontiguousarray(arr.copy(), dtype=np.float32),
+            )
+        )
 
     def save_recorded_csv_dialog(self):
-        if len(self.recorded_rows) == 0:
+        if self.recorded_sample_count() <= 0:
             QMessageBox.information(self, "No Data", "No timed recording samples in memory to save.")
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -4373,28 +5910,46 @@ class EMGVisualizer(QMainWindow):
         )
         if not path:
             return
-        data_path, _metadata_path = self.save_recorded_csv(path)
-        QMessageBox.information(
-            self,
-            "Saved",
-            f"Recorded CSV saved:\n{data_path}",
-        )
+        try:
+            data_path, _metadata_path = self.queue_recorded_csv_save(path, show_saved_dialog=True)
+            self.set_status("Saving recorded CSV in background...", "#00897b")
+            self.last_recorded_csv_path = data_path
+        except Exception as e:
+            QMessageBox.warning(self, "CSV Save", str(e))
 
     def save_recorded_csv(self, path):
-        if len(self.recorded_rows) == 0:
+        if self.recorded_sample_count() <= 0:
             raise ValueError("No recorded rows available.")
         data_csv_path, metadata_path, root_dir = self._resolve_record_output_paths(path)
-        channel_columns = self._channel_columns_from_rows(self.recorded_rows)
-        if len(channel_columns) == 0:
-            raise ValueError("No channel columns found in recorded rows.")
-        fieldnames = ["Timestamp_ms", "Label", "Trial_ID", "Phase"] + channel_columns
+        channel_columns = self._record_channel_columns()
+        fieldnames = ["Timestamp_ms", "Packet_Number", "Trial_ID"] + channel_columns + ["Label"]
         os.makedirs(os.path.dirname(data_csv_path) or ".", exist_ok=True)
         with open(data_csv_path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in self.recorded_rows:
-                writer.writerow(row)
-        self.save_recorded_metadata_txt(metadata_path, data_csv_path, root_dir)
+            writer = csv.writer(f)
+            writer.writerow(fieldnames)
+            for batch in self.recorded_batches:
+                data = np.asarray(batch.data, dtype=np.float32)
+                if data.ndim != 2 or data.shape[0] <= 0:
+                    continue
+                n_rows = data.shape[0]
+                n_cols = int(min(WIRELESS_TOTAL_CHANNELS, data.shape[1]))
+                for idx in range(n_rows):
+                    row = [
+                        float(batch.timestamps_ms[idx]) if idx < len(batch.timestamps_ms) else 0.0,
+                        int(batch.packet_numbers[idx]) if idx < len(batch.packet_numbers) else -1,
+                        int(batch.trial_id),
+                    ]
+                    row.extend(float(v) for v in data[idx, :n_cols])
+                    if n_cols < WIRELESS_TOTAL_CHANNELS:
+                        row.extend([""] * (WIRELESS_TOTAL_CHANNELS - n_cols))
+                    row.append(str(batch.label))
+                    writer.writerow(row)
+        self.save_recorded_metadata_txt(
+            metadata_path,
+            data_csv_path,
+            root_dir,
+            sample_count=self.recorded_sample_count(),
+        )
         self.last_recorded_csv_path = data_csv_path
         self.record_save_dir = root_dir or self.record_save_dir
         if self.data_collection_dialog and self.data_collection_dialog.isVisible():
@@ -4404,7 +5959,8 @@ class EMGVisualizer(QMainWindow):
     @classmethod
     def load_segments_from_record_csv(cls, path):
         segments = []
-        with open(path, newline="", encoding="utf-8") as f:
+        csv_path = cls._from_project_relative_path(path)
+        with open(csv_path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             if reader.fieldnames is None:
                 raise ValueError("CSV has no header.")
@@ -4412,7 +5968,7 @@ class EMGVisualizer(QMainWindow):
             label_col = field_map.get("label", "")
             trial_col = field_map.get("trial_id", "")
             phase_col = field_map.get("phase", "")
-            channel_cols = cls._channel_columns_from_fieldnames(reader.fieldnames)
+            channel_cols = cls._active_channel_columns_from_csv(csv_path)
             if not label_col:
                 raise ValueError("CSV missing required column: Label")
             if len(channel_cols) == 0:
@@ -4429,7 +5985,10 @@ class EMGVisualizer(QMainWindow):
                 phase = str(row.get(phase_col, "")).strip() if phase_col else ""
                 key = (label, trial, phase)
                 try:
-                    sample = [float(row.get(ch_name, 0.0)) for ch_name in channel_cols]
+                    sample = []
+                    for ch_name in channel_cols:
+                        raw_val = str(row.get(ch_name, "")).strip()
+                        sample.append(float(raw_val) if raw_val != "" else 0.0)
                 except Exception:
                     continue
 
@@ -4549,11 +6108,13 @@ class EMGVisualizer(QMainWindow):
         csv_paths = self._normalize_training_csv_paths(cfg.get("dataset_paths", []))
         if len(csv_paths) == 0:
             raise ValueError("No dataset CSV files selected.")
+        status_callback = cfg.get("_status_callback", None)
+        default_window_ms = DEFAULT_ANALYSIS_MS if callable(status_callback) else self.analysis_ms_spin.value()
 
         output_dir = str(cfg.get("output_dir", TRAINED_MODEL_DIR)).strip() or TRAINED_MODEL_DIR
         output_dir_abs = self._from_project_relative_path(output_dir)
         run_name = self._sanitize_filename_token(cfg.get("run_name", "rf_training"))
-        window_ms = int(max(20, cfg.get("window_ms", self.analysis_ms_spin.value())))
+        window_ms = int(max(20, cfg.get("window_ms", default_window_ms)))
         stride_ms = int(max(5, cfg.get("stride_ms", 50)))
         n_estimators = int(max(50, cfg.get("n_estimators", 400)))
         max_depth_value = int(max(0, cfg.get("max_depth", 0)))
@@ -4561,9 +6122,16 @@ class EMGVisualizer(QMainWindow):
         random_seed = int(max(0, cfg.get("random_seed", 42)))
         class_weight_balanced = bool(cfg.get("class_weight_balanced", True))
         auto_load_model = bool(cfg.get("auto_load_model", True))
+        defer_auto_load = bool(cfg.get("_defer_auto_load", False))
 
-        self.set_status("RF training: loading dataset CSV files...", "#6a1b9a")
-        QApplication.processEvents()
+        def emit_training_status(text, color="#6a1b9a"):
+            if callable(status_callback):
+                status_callback(text, color)
+            else:
+                self.set_status(text, color)
+                QApplication.processEvents()
+
+        emit_training_status("RF training: loading dataset CSV files...")
         segments = []
         segment_count_by_file = {}
         channel_count_by_file = {}
@@ -4601,8 +6169,7 @@ class EMGVisualizer(QMainWindow):
         win_samples = max(8, int((window_ms / 1000.0) * SAMPLE_RATE))
         stride_samples = max(1, int((stride_ms / 1000.0) * SAMPLE_RATE))
 
-        self.set_status("RF training: extracting features...", "#6a1b9a")
-        QApplication.processEvents()
+        emit_training_status("RF training: extracting features...")
         X = []
         y = []
         skipped_channel_segments = 0
@@ -4646,8 +6213,7 @@ class EMGVisualizer(QMainWindow):
         if np.min(class_counts) < 2:
             raise ValueError("Each class needs at least 2 windows for stratified split.")
 
-        self.set_status("RF training: splitting train/test...", "#6a1b9a")
-        QApplication.processEvents()
+        emit_training_status("RF training: splitting train/test...")
         X_train, X_test, y_train, y_test = train_test_split(
             X,
             y_idx,
@@ -4656,14 +6222,14 @@ class EMGVisualizer(QMainWindow):
             stratify=y_idx,
         )
 
-        self.set_status("RF training: fitting model...", "#6a1b9a")
-        QApplication.processEvents()
+        emit_training_status("RF training: fitting model...")
+        rf_jobs = int(max(1, (os.cpu_count() or 2) - 1))
         model = RandomForestClassifier(
             n_estimators=n_estimators,
             max_depth=None if max_depth_value <= 0 else max_depth_value,
             random_state=random_seed,
             class_weight="balanced" if class_weight_balanced else None,
-            n_jobs=-1,
+            n_jobs=rf_jobs,
         )
         model.fit(X_train, y_train)
 
@@ -4780,15 +6346,18 @@ class EMGVisualizer(QMainWindow):
         with open(summary_path, "w", encoding="utf-8") as f:
             f.write(summary + "\n")
 
-        if auto_load_model:
+        if auto_load_model and not defer_auto_load:
             self.load_rf_model(model_path)
             self.set_status("RF training complete and model loaded.", "#2e7d32")
+        elif auto_load_model and defer_auto_load:
+            emit_training_status("RF training complete; loading model...", "#2e7d32")
         else:
-            self.set_status("RF training complete.", "#2e7d32")
+            emit_training_status("RF training complete.", "#2e7d32")
 
         return {
             "run_dir": run_dir,
             "model_path": model_path,
+            "artifact": artifact if defer_auto_load else None,
             "summary_text": summary,
             "report_text": report,
             "cm": cm.tolist(),
@@ -5037,7 +6606,7 @@ class EMGVisualizer(QMainWindow):
             self.rf_last_prediction_ts = 0.0
             return None, 0.0
 
-        if self.data_buffer is None:
+        if self.raw_data_buffer is None:
             self.rf_last_class_confidences = np.zeros(len(self.rf_class_names), dtype=np.float32)
             self.rf_last_latency_ms = 0.0
             self.rf_prediction_rate_hz = 0.0
@@ -5045,14 +6614,14 @@ class EMGVisualizer(QMainWindow):
             return None, 0.0
 
         model_ch = int(max(1, self.rf_model_input_channels))
-        if self.data_buffer.shape[0] < model_ch:
+        if self.raw_data_buffer.shape[0] < model_ch:
             self.rf_last_class_confidences = np.zeros(len(self.rf_class_names), dtype=np.float32)
             self.rf_last_latency_ms = 0.0
             self.rf_prediction_rate_hz = 0.0
             self.rf_last_prediction_ts = 0.0
             return None, 0.0
 
-        n_avail = self.data_buffer.shape[1]
+        n_avail = self.raw_data_buffer.shape[1]
         if n_avail < self.rf_window_samples:
             self.rf_last_class_confidences = np.zeros(len(self.rf_class_names), dtype=np.float32)
             self.rf_last_latency_ms = 0.0
@@ -5062,7 +6631,7 @@ class EMGVisualizer(QMainWindow):
 
         try:
             t0 = time.perf_counter()
-            win = self.data_buffer[:model_ch, -self.rf_window_samples:].T  # (samples, channels)
+            win = self.raw_data_buffer[:model_ch, -self.rf_window_samples:].T  # (samples, channels)
             feats = rf_extract_window_features(win, sample_rate=SAMPLE_RATE).reshape(1, -1)
 
             pred_raw = self.rf_model.predict(feats)[0]
@@ -5147,6 +6716,10 @@ class EMGVisualizer(QMainWindow):
         self.flex_capture = []
         self.current_cal_phase_idx = -1
         self.data_buffer[:, :] = 0
+        if self.raw_data_buffer is not None:
+            self.raw_data_buffer[:, :] = 0
+        self.rf_valid_sample_count = 0
+        self.rf_samples_since_submit = 0
 
         self.timer.stop()
         self.btn_calibrate.setEnabled(False)
@@ -5211,27 +6784,43 @@ class EMGVisualizer(QMainWindow):
             return
 
         rest = np.vstack(self.rest_capture).astype(np.float32)      # (samples, channels)
-        self.baseline_offsets = np.median(rest, axis=0).astype(np.float32)
+        emg_count = int(min(self.active_emg_channel_count(), rest.shape[1]))
+        self.baseline_offsets = np.zeros(self.num_channels, dtype=np.float32)
+        if emg_count > 0:
+            self.baseline_offsets[:emg_count] = np.median(rest[:, :emg_count], axis=0).astype(np.float32)
         self.baseline_reference = self.baseline_offsets.copy()
 
-        rest_centered = rest - self.baseline_offsets[np.newaxis, :]
-        rest_rms = np.sqrt(np.mean(np.square(rest_centered), axis=0))
+        rest_centered = rest.copy()
+        if emg_count > 0:
+            rest_centered[:, :emg_count] = rest_centered[:, :emg_count] - self.baseline_offsets[np.newaxis, :emg_count]
+        rest_rms = np.ones(self.num_channels, dtype=np.float32)
+        if emg_count > 0:
+            rest_rms[:emg_count] = np.sqrt(np.mean(np.square(rest_centered[:, :emg_count]), axis=0)).astype(np.float32)
         self.rest_rms_ref = np.maximum(rest_rms.astype(np.float32), 1.0)
-        auto_rms = float(np.clip(np.mean(rest_rms) * 3.0, 20.0, 800.0))
+        auto_rms_source = rest_rms[:emg_count] if emg_count > 0 else rest_rms
+        auto_rms = float(np.clip(np.mean(auto_rms_source) * 3.0, 20.0, 800.0))
         self.threshold_spin.setValue(round(auto_rms, 1))
 
         if len(self.flex_capture) > 0:
             flex = np.vstack(self.flex_capture).astype(np.float32)  # (samples, channels)
-            flex_centered = flex - self.baseline_offsets[np.newaxis, :]
-            flex_rms = np.sqrt(np.mean(np.square(flex_centered), axis=0))
+            flex_centered = flex.copy()
+            if emg_count > 0:
+                flex_centered[:, :emg_count] = flex_centered[:, :emg_count] - self.baseline_offsets[np.newaxis, :emg_count]
+            flex_rms = np.ones(self.num_channels, dtype=np.float32)
+            if emg_count > 0:
+                flex_rms[:emg_count] = np.sqrt(np.mean(np.square(flex_centered[:, :emg_count]), axis=0)).astype(np.float32)
             self.flex_rms_ref = np.maximum(flex_rms.astype(np.float32), self.rest_rms_ref + 10.0)
-            dom_hz = self.compute_dominant_frequency(flex_centered.T)
+            dom_hz = self.compute_dominant_frequency(flex_centered[:, :emg_count].T if emg_count > 0 else flex_centered.T)
             auto_hz = float(np.clip(np.median(dom_hz) * 0.7, 20.0, FFT_MAX_HZ))
             self.hz_threshold_spin.setValue(round(auto_hz, 1))
         else:
             self.flex_rms_ref = np.maximum(self.rest_rms_ref * 3.0, self.rest_rms_ref + 10.0)
 
         self.data_buffer[:, :] = 0
+        if self.raw_data_buffer is not None:
+            self.raw_data_buffer[:, :] = 0
+        self.rf_valid_sample_count = 0
+        self.rf_samples_since_submit = 0
         self.is_calibrated = True
         self.onset_state[:] = False
         self.onset_count[:] = 0
@@ -5252,6 +6841,8 @@ class EMGVisualizer(QMainWindow):
         self.reset_fps_counters()
         self.timer.start(PLOT_REFRESH_MS)
         self.set_status("Calibrated - live graph/analysis running", "#00c853")
+        if self.rf_model is not None:
+            self.set_rf_status_reason(f"Buffering stream (0/{self.rf_window_samples} samples)", "success")
 
         summary = (
             f"Calibration complete.\n"
@@ -5280,26 +6871,48 @@ class EMGVisualizer(QMainWindow):
 
     def apply_python_baseline(self, raw_batch):
         # raw_batch shape: (samples, channels), baseline offsets shape: (channels,)
-        centered = raw_batch - self.baseline_offsets[np.newaxis, :]
+        adjusted = np.asarray(raw_batch, dtype=np.float32).copy()
+        emg_count = int(min(self.active_emg_channel_count(), adjusted.shape[1]))
+        if emg_count <= 0:
+            return adjusted
 
-        # Slow adaptive baseline correction near rest.
-        for ch in range(self.num_channels):
+        centered = adjusted[:, :emg_count] - self.baseline_offsets[np.newaxis, :emg_count]
+
+        # Slow adaptive baseline correction near rest for EMG channels only.
+        for ch in range(emg_count):
             near_rest = np.abs(centered[:, ch]) < BASE_ADAPT_GUARD
             if np.any(near_rest):
                 mean_err = float(np.mean(centered[near_rest, ch]))
                 self.baseline_offsets[ch] += BASE_ADAPT_ALPHA * mean_err
 
-        return raw_batch - self.baseline_offsets[np.newaxis, :]
+        adjusted[:, :emg_count] = adjusted[:, :emg_count] - self.baseline_offsets[np.newaxis, :emg_count]
+        return adjusted
 
-    def on_serial_batch(self, batch):
-        if self.data_buffer is None or batch is None or batch.size == 0:
+    @staticmethod
+    def _normalize_stream_payload(payload):
+        if isinstance(payload, dict):
+            batch = np.asarray(payload.get("batch", []), dtype=np.float32)
+            packet_numbers = np.asarray(payload.get("packet_numbers", []), dtype=np.int64).reshape(-1)
+            return batch, packet_numbers
+
+        batch = np.asarray(payload, dtype=np.float32)
+        return batch, np.zeros((0,), dtype=np.int64)
+
+    def on_serial_batch(self, payload):
+        if self.data_buffer is None or self.raw_data_buffer is None:
+            return
+        batch, packet_numbers = self._normalize_stream_payload(payload)
+        if batch is None or batch.size == 0:
             return
         if batch.ndim != 2 or batch.shape[1] != self.num_channels:
             return
 
         self._tick_data_fps(batch.shape[0])
 
-        clip_now = np.mean((batch <= 5.0) | (batch >= 4090.0), axis=0) * 100.0
+        clip_now = np.zeros(self.num_channels, dtype=np.float32)
+        emg_count = int(min(self.active_emg_channel_count(), batch.shape[1]))
+        if emg_count > 0:
+            clip_now[:emg_count] = np.mean((batch[:, :emg_count] <= 5.0) | (batch[:, :emg_count] >= 4090.0), axis=0) * 100.0
         self.last_clip_ratio = 0.90 * self.last_clip_ratio + 0.10 * clip_now.astype(np.float32)
 
         if self.calibration_active:
@@ -5312,8 +6925,17 @@ class EMGVisualizer(QMainWindow):
         if not self.is_calibrated:
             return  # Hard requirement: no graph/analysis before calibration.
 
+        self.append_record_batch(batch, packet_numbers=packet_numbers)
+        raw_new_data = batch.T  # (channels, samples)
+        raw_num_new = raw_new_data.shape[1]
+        if raw_num_new >= WINDOW_SIZE:
+            self.raw_data_buffer[:, :] = raw_new_data[:, -WINDOW_SIZE:]
+        else:
+            self.raw_data_buffer[:, :-raw_num_new] = self.raw_data_buffer[:, raw_num_new:]
+            self.raw_data_buffer[:, -raw_num_new:] = raw_new_data
+        self.rf_valid_sample_count = int(min(WINDOW_SIZE, self.rf_valid_sample_count + raw_num_new))
+
         centered_batch = self.apply_python_baseline(batch)
-        self.append_record_batch(centered_batch)
         new_data = centered_batch.T  # (channels, samples)
         num_new = new_data.shape[1]
 
@@ -5403,9 +7025,12 @@ class EMGVisualizer(QMainWindow):
 
         if self.rf_model is not None:
             model_name = os.path.basename(self.rf_model_path) if self.rf_model_path else "Loaded"
-            self.lbl_rf.setText(
-                f"RF Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
-            )
+            if self.rf_last_status_reason:
+                self.lbl_rf.setText(f"RF Model: {model_name} | {self.rf_last_status_reason}")
+            else:
+                self.lbl_rf.setText(
+                    f"RF Model: {model_name} | Pred: {self.rf_last_pred_label} ({self.rf_last_pred_conf * 100.0:.1f}%)"
+                )
             self.lbl_rf.setStyleSheet(themed_label_style("success"))
         else:
             self.lbl_rf.setText("RF Model: Not loaded")
@@ -5423,19 +7048,26 @@ class EMGVisualizer(QMainWindow):
             state = "Active" if active else "Rest"
             color = THEME_COLORS["success"] if active else THEME_COLORS["muted"]
             hz_flag = "ON" if self.latest_hz_active[i] else "OFF"
-            self.metrics_labels[i].setText(
-                f"CH{i + 1} | {state} | Hz: {hz_flag}\n"
-                f"MAV: {self.latest_mav[i]:.2f} - RMS: {self.latest_rms[i]:.2f} - FREQ: {self.latest_dom_hz[i]:.2f}Hz"
-            )
+            if self.is_wireless_imu_channel(i):
+                self.metrics_labels[i].setText(
+                    f"{self.channel_display_name(i)} | Angle\n"
+                    f"Value: {self.data_buffer[i, -1]:.2f} deg"
+                )
+            else:
+                self.metrics_labels[i].setText(
+                    f"{self.channel_display_name(i)} | {state} | Hz: {hz_flag}\n"
+                    f"MAV: {self.latest_mav[i]:.2f} - RMS: {self.latest_rms[i]:.2f} - FREQ: {self.latest_dom_hz[i]:.2f}Hz"
+                )
             self.metrics_labels[i].setStyleSheet(
                 f"color: {color}; font-family: Consolas; font-size: 15px; font-weight: bold;"
             )
 
-            line_color = THEME_COLORS["success"] if active else THEME_COLORS["accent"]
-            self.threshold_lines_pos[i].setValue(amp_threshold)
-            self.threshold_lines_neg[i].setValue(-amp_threshold)
-            self.threshold_lines_pos[i].setPen(pg.mkPen(line_color, width=1, style=Qt.DashLine))
-            self.threshold_lines_neg[i].setPen(pg.mkPen(line_color, width=1, style=Qt.DashLine))
+            if self.threshold_lines_pos[i] is not None and self.threshold_lines_neg[i] is not None:
+                line_color = THEME_COLORS["success"] if active else THEME_COLORS["accent"]
+                self.threshold_lines_pos[i].setValue(amp_threshold)
+                self.threshold_lines_neg[i].setValue(-amp_threshold)
+                self.threshold_lines_pos[i].setPen(pg.mkPen(line_color, width=1, style=Qt.DashLine))
+                self.threshold_lines_neg[i].setPen(pg.mkPen(line_color, width=1, style=Qt.DashLine))
 
         if self.analysis_window and self.analysis_window.isVisible():
             self.analysis_window.update_analysis_view(
@@ -5689,10 +7321,18 @@ class EMGVisualizer(QMainWindow):
     def compute_corr_matrix(segment):
         if segment.shape[0] < 2 or segment.shape[1] < 8:
             return np.eye(segment.shape[0], dtype=np.float32)
-        corr = np.corrcoef(segment)
+        std = np.std(segment, axis=1)
+        valid = np.isfinite(std) & (std > 1e-8)
+        if not np.any(valid):
+            return np.eye(segment.shape[0], dtype=np.float32)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = np.corrcoef(segment)
         corr = np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         if corr.ndim != 2:
             return np.eye(segment.shape[0], dtype=np.float32)
+        if not np.all(valid):
+            corr[~valid, :] = 0.0
+            corr[:, ~valid] = 0.0
         np.fill_diagonal(corr, 1.0)
         return np.clip(corr, -1.0, 1.0)
 
@@ -5868,10 +7508,21 @@ class EMGVisualizer(QMainWindow):
             return
 
         if self.check_graph_stream.isChecked():
-            for i in range(self.num_channels):
-                self.curves[i].setData(self.x_axis, self.data_buffer[i])
+            for row in self.plot_rows:
+                if row["kind"] == "single":
+                    ch = int(row["channel"])
+                    display_values = self._emg_display_values(ch)
+                    if display_values is not None:
+                        row["curve"].setData(self.x_axis, display_values)
+                    continue
 
-        if self.live_analysis_enabled and self.analysis_window and self.analysis_window.isVisible():
+                if row["kind"] == "imu_combined":
+                    channels = row["channels"]
+                    for curve, ch in zip(row["curves"], channels):
+                        curve.setData(self.x_axis, self.data_buffer[ch])
+            self.refresh_live_plot_ranges()
+
+        if (not self.task_session_active) and self.live_analysis_enabled and self.analysis_window and self.analysis_window.isVisible():
             self.update_analysis()
         else:
             if self.is_connected and self.is_calibrated:
@@ -5881,10 +7532,16 @@ class EMGVisualizer(QMainWindow):
         self._tick_ui_fps()
 
     def on_serial_error(self, message):
-        QMessageBox.critical(self, "Serial Error", message)
+        QMessageBox.critical(self, "Stream Error", message)
         self.disconnect_serial()
 
     def closeEvent(self, event):
+        for worker in list(self.record_save_workers):
+            try:
+                worker.wait()
+            except Exception:
+                pass
+        self.record_save_workers = []
         if self.realtime_classification_window is not None:
             try:
                 self.realtime_classification_window.close()
@@ -5899,6 +7556,10 @@ class EMGVisualizer(QMainWindow):
             self.rf_worker = None
         self.disconnect_serial()
         event.accept()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        QTimer.singleShot(0, self.apply_plot_row_layout)
 
     def showEvent(self, event):
         super().showEvent(event)
