@@ -5,6 +5,21 @@ FFT_MIN_HZ = 20.0
 FFT_MAX_HZ = 220.0
 BANDS = [(20.0, 60.0), (60.0, 120.0), (120.0, 220.0)]
 
+# Cache Hanning windows / FFT bin frequencies by window length. They never change per
+# window size, so recomputing them for every extracted window is wasted work.
+_FFT_CACHE = {}
+
+
+def _hanning_and_freqs(n, sample_rate):
+    key = (int(n), float(sample_rate))
+    cached = _FFT_CACHE.get(key)
+    if cached is None:
+        win = np.hanning(n).astype(np.float32)
+        freqs = np.fft.rfftfreq(int(n), d=1.0 / float(sample_rate))
+        cached = (win, freqs)
+        _FFT_CACHE[key] = cached
+    return cached
+
 
 def _ensure_window_shape(window):
     arr = np.asarray(window, dtype=np.float32)
@@ -74,6 +89,55 @@ def _spectral_1d(x, sample_rate):
     }
 
 
+def _spectral_all(A, sample_rate):
+    """Vectorized equivalent of _spectral_1d applied to every channel at once.
+
+    A: (n_ch, n_samples), C-contiguous. Reductions run along the contiguous last axis
+    so numpy's pairwise summation matches the per-channel 1D path bit-for-bit.
+    """
+    n_ch, n = A.shape
+    zeros = np.zeros(n_ch, dtype=np.float64)
+    band_zeros = np.zeros((n_ch, len(BANDS)), dtype=np.float64)
+    if n < 8:
+        return zeros, zeros, zeros, zeros, band_zeros
+
+    # _spectral_1d re-centers its input, so re-center per channel (row) here too.
+    xc = A - np.mean(A, axis=1, keepdims=True)
+    win, freqs = _hanning_and_freqs(n, sample_rate)
+    spec = np.abs(np.fft.rfft(xc * win[np.newaxis, :], axis=1)) ** 2  # (n_ch, n_freq)
+
+    mask = (freqs >= FFT_MIN_HZ) & (freqs <= FFT_MAX_HZ)
+    if not np.any(mask):
+        return zeros, zeros, zeros, zeros, band_zeros
+
+    sv = np.ascontiguousarray(spec[:, mask])  # (n_ch, n_valid), contiguous rows
+    fv = freqs[mask]                           # (n_valid,)
+    total = np.sum(sv, axis=1) + 1e-9          # (n_ch,)
+
+    peak_hz = fv[np.argmax(sv, axis=1)]
+    mean_hz = np.sum(sv * fv[np.newaxis, :], axis=1) / total
+    csum = np.cumsum(sv, axis=1)
+    med_idx = np.argmax(csum >= (0.5 * total)[:, np.newaxis], axis=1)
+    med_hz = fv[med_idx]
+
+    p = sv / total[:, np.newaxis]
+    spec_entropy = -np.sum(p * np.log2(p + 1e-12), axis=1) / np.log2(sv.shape[1] + 1e-9)
+
+    band_power = np.zeros((n_ch, len(BANDS)), dtype=np.float64)
+    for i, (lo, hi) in enumerate(BANDS):
+        bmask = (fv >= lo) & (fv < hi)
+        if np.any(bmask):
+            band_power[:, i] = np.sum(np.ascontiguousarray(sv[:, bmask]), axis=1) / total * 100.0
+
+    return (
+        mean_hz.astype(np.float64),
+        med_hz.astype(np.float64),
+        peak_hz.astype(np.float64),
+        spec_entropy.astype(np.float64),
+        band_power,
+    )
+
+
 def feature_names(num_channels=DEFAULT_NUM_CHANNELS):
     n_ch = int(max(1, num_channels))
     names = []
@@ -107,7 +171,106 @@ def feature_names(num_channels=DEFAULT_NUM_CHANNELS):
     return names
 
 
+def _pairwise_corr_features(arr_centered):
+    """Upper-triangle channel correlations, identical to the reference loop."""
+    n_ch = arr_centered.shape[1]
+    std = np.std(arr_centered, axis=0)
+    valid = np.isfinite(std) & (std > 1e-8)
+    if np.any(valid):
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = np.corrcoef(arr_centered.T)
+    else:
+        corr = np.eye(n_ch, dtype=np.float32)
+    corr = np.atleast_2d(np.nan_to_num(corr, nan=0.0, posinf=0.0, neginf=0.0))
+    if not np.all(valid):
+        corr[~valid, :] = 0.0
+        corr[:, ~valid] = 0.0
+        np.fill_diagonal(corr, 1.0)
+    out = []
+    for a in range(n_ch):
+        for b in range(a + 1, n_ch):
+            out.append(float(corr[a, b]))
+    return out
+
+
 def extract_window_features(window, sample_rate=500):
+    """Vectorized feature extraction. Produces the same feature vector (verified
+    bit-for-bit) as _extract_window_features_reference below, but computes all channels
+    at once instead of looping in Python. The reference is kept as the canonical
+    definition; diff against it if this file is ever changed.
+    """
+    arr = _ensure_window_shape(window)
+    n_samples = arr.shape[0]
+    n_ch = arr.shape[1]
+    arr_centered = arr - np.mean(arr, axis=0, keepdims=True)
+    # Channels as rows, samples as the contiguous last axis. Reducing along axis=1 of a
+    # C-contiguous array reproduces numpy's per-channel 1D pairwise summation bit-for-bit,
+    # which the loop-based reference relies on.
+    A = np.ascontiguousarray(arr_centered.T)  # (n_ch, n_samples)
+
+    zc_thresh = 10.0
+    ssc_thresh = 8.0
+    wamp_thresh = 12.0
+
+    abs_x = np.abs(A)
+    mav = np.mean(abs_x, axis=1)
+    rms = np.sqrt(np.mean(np.square(A), axis=1))
+    iemg = np.sum(abs_x, axis=1)
+    var = np.var(A, axis=1)
+
+    if n_samples > 1:
+        dx = np.diff(A, axis=1)
+        abs_dx = np.abs(dx)
+        wl = np.sum(abs_dx, axis=1)
+        prod = A[:, :-1] * A[:, 1:]
+        zc = np.sum((prod < 0) & (abs_dx >= zc_thresh), axis=1)
+        wamp = np.sum(abs_dx >= wamp_thresh, axis=1)
+    else:
+        wl = np.zeros(n_ch, dtype=np.float32)
+        zc = np.zeros(n_ch, dtype=np.int64)
+        wamp = np.zeros(n_ch, dtype=np.int64)
+
+    if n_samples > 2:
+        s1 = A[:, 1:-1] - A[:, :-2]
+        s2 = A[:, 1:-1] - A[:, 2:]
+        ssc = np.sum(((s1 * s2) > 0) & ((np.abs(s1) + np.abs(s2)) >= ssc_thresh), axis=1)
+    else:
+        ssc = np.zeros(n_ch, dtype=np.int64)
+
+    mean_hz, median_hz, peak_hz, spec_entropy, band_power = _spectral_all(A, sample_rate)
+
+    # Assemble the 15 per-channel features in the reference column order, then flatten
+    # row-major so the layout is [ch0 x15, ch1 x15, ...] exactly like the loop version.
+    per_ch = np.column_stack([
+        mav.astype(np.float64),
+        rms.astype(np.float64),
+        iemg.astype(np.float64),
+        var.astype(np.float64),
+        wl.astype(np.float64),
+        zc.astype(np.float64),
+        ssc.astype(np.float64),
+        wamp.astype(np.float64),
+        mean_hz,
+        median_hz,
+        peak_hz,
+        spec_entropy,
+        band_power[:, 0],
+        band_power[:, 1],
+        band_power[:, 2],
+    ])
+    feats = list(per_ch.reshape(-1))
+
+    rms_vals = rms.astype(np.float32)
+    mean_rms = float(np.mean(rms_vals) + 1e-9)
+    feats.extend((rms_vals / mean_rms).tolist())
+
+    feats.extend(_pairwise_corr_features(arr_centered))
+
+    return np.asarray(feats, dtype=np.float32)
+
+
+def _extract_window_features_reference(window, sample_rate=500):
+    """Original per-channel implementation kept as the correctness reference."""
     arr = _ensure_window_shape(window)
     n_samples = arr.shape[0]
     n_ch = arr.shape[1]
