@@ -15,7 +15,13 @@ The application is built around a complete workflow:
 ## Project Layout
 
 ```text
-`01_BioWave-EMG Data Collection APP/
+EMG_with_IMU/
+|-- esp_code_emg_imu.txt
+|-- archive/
+|   |-- app.py
+|   |-- esp_code.txt
+|   `-- recordings/
+`-- 01_BioWave-EMG Data Collection APP/
     |-- README.md
     |-- requirements.txt
     |-- code/
@@ -159,16 +165,19 @@ The integrated trainer in `main.py` supports multiple selected dataset CSV files
 - Sample rate.
 - Training setup and evaluation results.
 
-The newest saved run currently present in this workspace is:
+The integrated trainer defaults are tuned for responsive real-time inference:
 
-```text
-trained_model/rf_training_20260609_231907
-Accuracy: 0.9071
-Input channels: 11
-Classes: Left, Rest, Right, fist_close
-Window: 200 ms / 100 samples
-Stride: 50 ms / 25 samples
-```
+- Trees (`n_estimators`): 150
+- Max depth: 16
+- Minimum samples per leaf: 2
+
+These give fast live predictions at minimal accuracy cost compared to larger forests, and all three are adjustable in the training dialog.
+
+The trainer uses a group-aware train/test split keyed to each source recording, so overlapping windows from the same recording never straddle the train/test boundary. This removes the leakage that would otherwise inflate reported accuracy. When a dataset is too small for a grouped split to keep every class on both sides, it falls back to a stratified split.
+
+Feature extraction across windows is parallelized (joblib) for larger datasets.
+
+Run folders are timestamped, for example `trained_model/rf_training_<timestamp>/`. Each `training_setup.json` records the window/stride, hyperparameters, channel count, and dataset paths used for that run.
 
 ## Feature Extraction
 
@@ -196,6 +205,8 @@ n * 15 + n + (n * (n - 1) / 2)
 
 For 11 channels this produces 231 features.
 
+Features are computed with a vectorized implementation that processes all channels at once. The original per-channel implementation is retained in the same file as `_extract_window_features_reference`, and the two are verified to produce bit-identical output. If you ever change `rf_features.py`, keep the two in sync (diff the fast path against the reference) so existing trained models stay compatible.
+
 ## Typical Workflow
 
 1. Start the app with `python code/main.py`.
@@ -215,16 +226,19 @@ For 11 channels this produces 231 features.
 At the time this README was updated, the workspace contains:
 
 - 5 Python source files in `code/`.
-- 12 dataset bundles under `dataset/`.
-- 8 trained model runs under `trained_model/`.
+- 14 dataset bundles under `dataset/`.
+- 6 trained model runs under `trained_model/`.
 - A current ESP32-S3 EMG plus IMU firmware text file at the repository root.
 - Archived legacy app, firmware, and recording files under `archive/`.
+
+Dataset and trained-model counts drift as you record and train; treat the numbers above as a snapshot.
 
 ## Maintenance Notes
 
 - `main.py` is the primary application and is large. Future refactors should split hardware IO, recording, training, and analysis into smaller modules.
 - Prefer the integrated training UI in `main.py` for current 8 EMG plus 3 IMU recordings.
-- Treat `rf_features.py` as a compatibility boundary. Changing it requires retraining models.
+- Treat `rf_features.py` as a compatibility boundary. Changing it requires retraining models. Keep the vectorized path and `_extract_window_features_reference` bit-identical.
+- Real-time behavior is tuned for responsiveness: plot antialiasing is off by default (see `ENABLE_ANTIALIAS`/`ENABLE_OPENGL`), plots use peak downsampling and clip-to-view, live inference is capped at `RF_MAX_PREDICTION_HZ` with an in-flight guard and majority-vote label smoothing, and the Live Analysis window splits cheap metrics from the expensive correlation/coherence matrices (`LIVE_ANALYSIS_HEAVY_REFRESH_MS`). These knobs are constants near the top of `main.py`.
 - `requirements.txt` is currently unpinned. Pin versions if this app needs reproducible installs.
 - `__pycache__/`, generated datasets, and trained `.joblib` model artifacts are runtime outputs. Decide deliberately whether to keep them in version control.
 - Keep firmware access keys private and never commit real Wi-Fi credentials or production access keys.
