@@ -1,6 +1,6 @@
-# BioWave - EMG
+# BioWave-GUI
 
-BioWave - EMG is a Python desktop application for real-time EMG monitoring, guided dataset collection, Random Forest training, and live gesture classification. The current project supports both a development simulator and ESP32-S3 based hardware that streams 8 EMG channels plus BNO080 IMU orientation data.
+BioWave-GUI is a Python desktop application for real-time EMG monitoring, guided dataset collection, Random Forest training, and live gesture classification. It supports both a development simulator and ESP32-S3 based hardware that streams 8 EMG channels plus BNO080 IMU orientation data.
 
 The application is built around a complete workflow:
 
@@ -15,24 +15,18 @@ The application is built around a complete workflow:
 ## Project Layout
 
 ```text
-EMG_with_IMU/
-|-- esp_code_emg_imu.txt
-|-- archive/
-|   |-- app.py
-|   |-- esp_code.txt
-|   `-- recordings/
-`-- 01_BioWave-EMG Data Collection APP/
-    |-- README.md
-    |-- requirements.txt
-    |-- code/
-    |   |-- main.py
-    |   |-- rf_features.py
-    |   |-- train_rf_model_gui.py
-    |   |-- emg_simulator_app.py
-    |   |-- app_theme.py
-    |   `-- images/app_icon.png
-    |-- dataset/
-    `-- trained_model/
+BioWave-GUI/
+|-- README.md
+|-- requirements.txt
+|-- code/
+|   |-- main.py
+|   |-- rf_features.py
+|   |-- train_rf_model_gui.py
+|   |-- emg_simulator_app.py
+|   |-- app_theme.py
+|   `-- images/app_icon.png
+|-- dataset/
+`-- trained_model/
 ```
 
 ## Code Guide
@@ -42,8 +36,8 @@ EMG_with_IMU/
 - `code/emg_simulator_app.py` creates synthetic EMG streams for development. TCP mode is the easiest way to test the main app without hardware.
 - `code/train_rf_model_gui.py` is a smaller standalone trainer. It is useful for older 4-channel CSV workflows, but the integrated trainer in `main.py` is the current path for variable-channel datasets.
 - `code/app_theme.py` centralizes the PyQt dark theme, button styles, label styles, and Windows title-bar styling.
-- `esp_code_emg_imu.txt` is the current ESP32-S3 firmware source text for Wi-Fi discovery/control, USB provisioning, 8-channel EMG sampling, BNO080 IMU polling, and UDP streaming.
-- `archive/` contains older app, firmware, and recording artifacts kept for reference.
+
+The companion ESP32-S3 firmware (Wi-Fi discovery/control, USB provisioning, 8-channel EMG sampling, BNO080 IMU polling, and UDP streaming) is maintained separately. This repository contains only the desktop GUI application and its app-side stream parser.
 
 ## Requirements
 
@@ -59,10 +53,9 @@ scikit-learn
 PyWavelets
 ```
 
-Recommended setup from the app folder:
+Recommended setup from the repository root:
 
 ```powershell
-cd "01_BioWave-EMG Data Collection APP"
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
@@ -73,7 +66,7 @@ If `python` is not available on your Windows PATH, install Python and enable the
 
 ## Running The App
 
-From `01_BioWave-EMG Data Collection APP/`:
+From the repository root:
 
 ```powershell
 python code/main.py
@@ -99,7 +92,7 @@ socket://127.0.0.1:7000
 
 ## Hardware And Streaming
 
-The current firmware target is an ESP32-S3 with:
+The app connects to an ESP32-S3 running the companion BioWave firmware, which provides:
 
 - 8 EMG analog channels sampled at 500 Hz.
 - BNO080 fused orientation output for roll, pitch, and yaw.
@@ -108,15 +101,9 @@ The current firmware target is an ESP32-S3 with:
 - UDP data streaming on port `5000`.
 - HMAC-authenticated wireless control commands.
 
-The wireless packet format uses a `BWIM` binary header followed by 5 frames per UDP packet. Each frame contains EMG values, IMU sample metadata, roll, pitch, yaw, and an IMU freshness flag. The main app includes a `WirelessStreamWorker` parser for this combined EMG plus IMU format.
+The wireless packet format uses a `BWIM` binary header followed by 5 frames per UDP packet. Each frame contains EMG values, IMU sample metadata, roll, pitch, yaw, and an IMU freshness flag. The app includes a `WirelessStreamWorker` parser for this combined EMG plus IMU format.
 
-Before flashing firmware, change:
-
-```cpp
-static const char *DEVICE_ACCESS_KEY = "CHANGE_THIS_TO_A_LONG_RANDOM_KEY";
-```
-
-The same access key must be entered in the desktop app when connecting wirelessly.
+Wireless control commands are authenticated with a shared access key. The same key must be configured in the firmware and entered in the desktop app when connecting wirelessly. Keep this key private and never commit real keys or Wi-Fi credentials.
 
 ## Data Collection
 
@@ -221,15 +208,13 @@ Features are computed with a vectorized implementation that processes all channe
 10. Load the generated `rf_realtime_model.joblib`.
 11. Open real-time classification and monitor predictions.
 
-## Current Repository State
+## Repository State
 
-At the time this README was updated, the workspace contains:
+At the time this README was updated, the repository contains:
 
 - 5 Python source files in `code/`.
 - 14 dataset bundles under `dataset/`.
 - 6 trained model runs under `trained_model/`.
-- A current ESP32-S3 EMG plus IMU firmware text file at the repository root.
-- Archived legacy app, firmware, and recording files under `archive/`.
 
 Dataset and trained-model counts drift as you record and train; treat the numbers above as a snapshot.
 
@@ -241,4 +226,4 @@ Dataset and trained-model counts drift as you record and train; treat the number
 - Real-time behavior is tuned for responsiveness: plot antialiasing is off by default (see `ENABLE_ANTIALIAS`/`ENABLE_OPENGL`), plots use peak downsampling and clip-to-view, live inference is capped at `RF_MAX_PREDICTION_HZ` with an in-flight guard and majority-vote label smoothing, and the Live Analysis window splits cheap metrics from the expensive correlation/coherence matrices (`LIVE_ANALYSIS_HEAVY_REFRESH_MS`). These knobs are constants near the top of `main.py`.
 - `requirements.txt` is currently unpinned. Pin versions if this app needs reproducible installs.
 - `__pycache__/`, generated datasets, and trained `.joblib` model artifacts are runtime outputs. Decide deliberately whether to keep them in version control.
-- Keep firmware access keys private and never commit real Wi-Fi credentials or production access keys.
+- Keep wireless access keys and Wi-Fi credentials private; never commit real keys.
